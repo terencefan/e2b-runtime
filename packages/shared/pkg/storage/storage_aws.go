@@ -316,6 +316,7 @@ func (o *awsObject) StoreFile(ctx context.Context, path string, opts ...PutOptio
 			Metadata:             p.Metadata,
 			ServerSideEncryption: o.sse.algorithm,
 			SSEKMSKeyId:          o.sse.kmsKeyID,
+			ChecksumAlgorithm:    types.ChecksumAlgorithmSha256,
 		},
 	)
 	if err == nil {
@@ -350,6 +351,7 @@ func (o *awsObject) Put(ctx context.Context, data []byte, opts ...PutOption) err
 			Metadata:             ApplyPutOptions(opts).Metadata,
 			ServerSideEncryption: o.sse.algorithm,
 			SSEKMSKeyId:          o.sse.kmsKeyID,
+			ChecksumAlgorithm:    types.ChecksumAlgorithmSha256,
 		},
 	)
 	if err != nil {
@@ -492,12 +494,13 @@ func (m *awsPartUploader) Start(ctx context.Context) error {
 		// inherit it (only SSE-C would need it repeated per part).
 		ServerSideEncryption: m.sse.algorithm,
 		SSEKMSKeyId:          m.sse.kmsKeyID,
-		// The SDK's default integrity protections attach CRC32 checksums to
+		// Use SHA256 for compatibility with S3 endpoints that reject CRC32.
+		// Integrity protections attach SHA256 checksums to
 		// UploadPart requests; S3 requires the algorithm to be declared at
 		// initiation and echoed per part in Complete. Declare it explicitly on
 		// every call so the flow is consistent regardless of SDK/env config
 		// (manager.Uploader does the same for the uncompressed path).
-		ChecksumAlgorithm: types.ChecksumAlgorithmCrc32,
+		ChecksumAlgorithm: types.ChecksumAlgorithmSha256,
 	})
 	if err != nil {
 		return fmt.Errorf("failed to initiate multipart upload: %w", err)
@@ -520,7 +523,7 @@ func (m *awsPartUploader) UploadPart(ctx context.Context, partIndex int, data ..
 		PartNumber:        aws.Int32(int32(partIndex)),
 		Body:              body,
 		ContentLength:     aws.Int64(body.Size()),
-		ChecksumAlgorithm: types.ChecksumAlgorithmCrc32,
+		ChecksumAlgorithm: types.ChecksumAlgorithmSha256,
 	})
 	if err != nil {
 		return fmt.Errorf("failed to upload part %d: %w", partIndex, err)
@@ -528,9 +531,9 @@ func (m *awsPartUploader) UploadPart(ctx context.Context, partIndex int, data ..
 
 	m.mu.Lock()
 	m.parts = append(m.parts, types.CompletedPart{
-		ETag:          out.ETag,
-		ChecksumCRC32: out.ChecksumCRC32,
-		PartNumber:    aws.Int32(int32(partIndex)),
+		ETag:           out.ETag,
+		ChecksumSHA256: out.ChecksumSHA256,
+		PartNumber:     aws.Int32(int32(partIndex)),
 	})
 	m.mu.Unlock()
 

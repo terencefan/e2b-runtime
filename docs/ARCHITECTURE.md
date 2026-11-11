@@ -1506,3 +1506,7 @@ embed/                  E2B Embed: the whole stack on one machine (Compose, Terr
 Cross-service contracts are all generated: OpenAPI specs in `spec/`, gRPC protos in
 `packages/orchestrator/*.proto` and `packages/envd/spec/`, SQL in `packages/db/queries/`.
 Run `make generate` after changing any of them.
+
+## Canary S3 compatibility build
+
+This deployment build selects SHA256 for S3 PUT and multipart uploads, including compressed parts and completion checksums. This preserves transport integrity on S3-compatible endpoints that reject CRC32. It does not alter object keys, snapshot formats, access controls, or bucket lifecycle policy. The build is based on public commit fa14b81a9078a0c5ced0ed0623111774dac9539d and is identified separately from the official prebuilt binary.
