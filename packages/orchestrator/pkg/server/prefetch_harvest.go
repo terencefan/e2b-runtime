@@ -121,9 +121,17 @@ type harvestUpload interface {
 // orchestration itself stays agnostic of them.
 type factoryResumer struct {
 	factory *sandbox.Factory
+	admit   func(context.Context, int64, bool) (func(), error)
 }
 
 func (r factoryResumer) ResumeForHarvest(ctx context.Context, t sbxtemplate.Template, config *sandbox.Config, runtime sandbox.RuntimeMetadata, startedAt, endAt time.Time) (harvestInstance, error) {
+	if r.admit != nil {
+		release, err := r.admit(ctx, config.RamMB, config.HugePages)
+		if err != nil {
+			return nil, err
+		}
+		defer release()
+	}
 	sbx, err := r.factory.ResumeSandbox(
 		ctx,
 		t,
@@ -163,7 +171,7 @@ type prefetchHarvester struct {
 
 func (s *Server) newPrefetchHarvester() *prefetchHarvester {
 	return &prefetchHarvester{
-		resumer:   factoryResumer{factory: s.sandboxFactory},
+		resumer:   factoryResumer{factory: s.sandboxFactory, admit: s.admitHugePages},
 		templates: s.templateCache,
 		uploadMetadata: func(ctx context.Context, meta metadata.Template, objectMetadata storage.ObjectMetadata) error {
 			return metadata.UploadMetadata(ctx, s.persistence, meta, objectMetadata)

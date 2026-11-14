@@ -61,6 +61,7 @@ func sandboxDrainLogInterval(elapsed time.Duration) time.Duration {
 }
 
 type Server struct {
+	hugePages *hugePageAdmission
 	orchestrator.UnimplementedSandboxServiceServer
 	orchestrator.UnimplementedChunkServiceServer
 
@@ -149,6 +150,9 @@ func New(ctx context.Context, cfg ServiceConfig) (*Server, error) {
 		done:              make(chan struct{}),
 	}
 
+	if cfg.Config.MemoryBudgetMiB > 0 {
+		server.hugePages = &hugePageAdmission{read: readHugePageMetrics, budgetMiB: cfg.Config.MemoryBudgetMiB}
+	}
 	meter := cfg.Tel.MeterProvider.Meter("github.com/e2b-dev/infra/packages/orchestrator/pkg/server")
 
 	sandboxCreateDuration, err := telemetry.GetHistogram(meter, telemetry.OrchestratorSandboxCreateDurationName)
