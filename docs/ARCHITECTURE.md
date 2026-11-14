@@ -638,3 +638,19 @@ tests/integration/      Integration tests against a live deployment
 Cross-service contracts are all generated: OpenAPI specs in `spec/`, gRPC protos in
 `packages/orchestrator/*.proto` and `packages/envd/spec/`, SQL in `packages/db/queries/`.
 Run `make generate` after changing any of them.
+
+## Strict memory admission backport
+
+This patch is based on stable release `2026.30` (`f32ee8a2`), which predates
+the newer upstream hugepage admission gate. It backports that gate's mutex and
+in-flight reservation algorithm, without upgrading the release to main.
+`MEMORY_BUDGET_MIB=466944` enables a 456 GiB budget shared by mixed guest sizes;
+zero preserves release behavior. The ceiling excludes kernel overcommit and is
+capped by the persistent hugepage base pool. Missing current kernel metrics fail
+closed. Create, checkpoint resume, and prefetch resume use the same gate.
+Ordinary-page guests are refused in strict mode. Kernel used/reserved counters
+carry mapped guest RAM after in-flight reservations end.
+
+Validate full guest RAM accounting through balloon/discard on the target
+Firecracker/kernel before production enablement. This stable-release backport
+is not deployed, and does not contain existing production-specific S3 patches.

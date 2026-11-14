@@ -233,6 +233,11 @@ func (s *Server) Create(ctx context.Context, req *orchestrator.SandboxCreateRequ
 		}
 	}
 	defer s.startingSandboxes.Release(1)
+	releaseMemory, admissionErr := s.admitHugePages(ctx, req.GetSandbox().GetRamMb(), req.GetSandbox().GetHugePages())
+	if admissionErr != nil {
+		return nil, admissionErr
+	}
+	defer releaseMemory()
 
 	template, err := s.templateCache.GetTemplate(
 		ctx,
@@ -1316,6 +1321,11 @@ func (s *Server) checkpointResumeFresh(ctx context.Context, sbx *sandbox.Sandbox
 	// the API, routing catalog, and analytics) but with a fresh LifecycleID
 	// so the old sandbox's cleanup goroutine won't
 	// accidentally evict the resumed sandbox from the map.
+	releaseMemory, admissionErr := s.admitHugePages(ctx, sbx.Config.RamMB, sbx.Config.HugePages)
+	if admissionErr != nil {
+		return nil, admissionErr
+	}
+	defer releaseMemory()
 	resumedSbx, err := s.sandboxFactory.ResumeSandbox(
 		ctx,
 		template,

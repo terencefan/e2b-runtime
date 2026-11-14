@@ -76,6 +76,7 @@ func makePathsAbsolute(c *BuilderConfig) error {
 }
 
 type Config struct {
+	MemoryBudgetMiB uint64 `env:"MEMORY_BUDGET_MIB"`
 	BuilderConfig
 
 	ClickhouseConnectionString  string            `env:"CLICKHOUSE_CONNECTION_STRING"`
