@@ -1571,3 +1571,26 @@ Cross-service contracts are all generated: OpenAPI specs in `spec/`, gRPC protos
 `packages/orchestrator/*.proto`, `packages/scheduling-api/e2b/` and `packages/envd/spec/`, SQL in `packages/db/queries/`
 and `packages/scheduling-api/internal/db/queries/sql/`.
 Run `make generate` after changing any of them.
+
+## Non-overcommitted host memory admission
+
+`MEMORY_BUDGET_MIB` on the orchestrator enables strict mode in the existing
+hugepage admission gate. Set it to `466944` for a 456 GiB guest-memory budget.
+The effective ceiling is the lesser of this budget and `nr_hugepages`; neither
+surplus nor `nr_overcommit_hugepages` expands it. Zero retains upstream behavior.
+
+Admission reads current kernel hugepage used/reserved counters without stale
+fallback, adds the existing in-flight reservations, and checks the requested
+RAM under the existing gate mutex. Each request is rounded to whole hugepages;
+mixed sandbox sizes share one byte budget. Once a guest maps its memory, the
+kernel reservation carries its backing until that mapping is released. Missing
+metrics fail closed in strict mode. Checkpoint and prefetch resumes use the same
+checked gate, and ordinary-page internal resumes are refused in strict mode.
+Capacity refusals use ResourceExhausted so the existing placement retry path can
+try another node. No new ledger, Redis storage, SDK API, or background queue is
+introduced. The host must retain ordinary memory for services and VM overhead.
+
+Deployment requires validating kernel reservation behavior on the actual
+Firecracker version, including guest balloon/discard, before enabling production
+traffic. Strict mode does not reinterpret the existing CPU placement score as a
+hard CPU limit.

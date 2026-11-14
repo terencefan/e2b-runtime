@@ -322,3 +322,9 @@ func isRealDisk(p disk.PartitionStat) bool {
 
 	return true
 }
+
+// ReadMemoryMetrics returns a fresh sample without falling back to stale counters.
+// Hard admission must fail closed if the current pool cannot be read.
+func (h *HostMetrics) ReadMemoryMetrics(ctx context.Context) (*MemoryMetrics, error) {
+	return readMemory(ctx)
+}

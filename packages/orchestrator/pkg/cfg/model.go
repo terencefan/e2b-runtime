@@ -118,6 +118,9 @@ func makePathsAbsolute(c *BuilderConfig) error {
 }
 
 type Config struct {
+	// MemoryBudgetMiB enables strict, non-overcommitted hugepage admission; zero preserves upstream behavior.
+	MemoryBudgetMiB uint64 `env:"MEMORY_BUDGET_MIB"`
+
 	BuilderConfig
 
 	ClickhouseConnectionString  string            `env:"CLICKHOUSE_CONNECTION_STRING"`

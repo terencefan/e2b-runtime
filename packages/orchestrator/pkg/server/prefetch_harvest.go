@@ -144,7 +144,7 @@ type harvestUpload interface {
 type factoryResumer struct {
 	factory *sandbox.Factory
 	// hold counts the throwaway's hugepages toward the create admission; nil holds nothing.
-	hold func(context.Context, *sandbox.Config) func()
+	hold func(context.Context, *sandbox.Config) (func(), error)
 }
 
 func (r factoryResumer) ResumeForHarvest(ctx context.Context, t sbxtemplate.Template, config *sandbox.Config, runtime sandboxtypes.RuntimeMetadata, startedAt, endAt time.Time, envdVersion string) (harvestInstance, error) {
@@ -152,7 +152,10 @@ func (r factoryResumer) ResumeForHarvest(ctx context.Context, t sbxtemplate.Temp
 	// sandbox.
 	opts := append(sandbox.ThrowawayResumeOptions(), sandbox.WithInheritedEnvdVersion(envdVersion))
 	if r.hold != nil {
-		releaseHugePages := r.hold(ctx, config)
+		releaseHugePages, err := r.hold(ctx, config)
+		if err != nil {
+			return nil, err
+		}
 		defer releaseHugePages()
 		opts = append(opts, sandbox.WithGuestMemoryReserved(releaseHugePages))
 	}
@@ -194,7 +197,7 @@ type prefetchHarvester struct {
 
 func (s *Server) newPrefetchHarvester() *prefetchHarvester {
 	return &prefetchHarvester{
-		resumer:   factoryResumer{factory: s.sandboxFactory, hold: s.holdHugePages},
+		resumer:   factoryResumer{factory: s.sandboxFactory, hold: s.checkedHoldHugePages},
 		templates: s.templateCache,
 		uploadMetadata: func(ctx context.Context, meta metadata.Template, objectMetadata storage.ObjectMetadata) error {
 			return metadata.UploadMetadata(ctx, s.persistence, meta, objectMetadata)

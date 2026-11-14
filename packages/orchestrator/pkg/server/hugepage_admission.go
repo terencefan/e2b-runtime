@@ -4,6 +4,7 @@ package server
 
 import (
 	"context"
+	"math"
 	"sync"
 
 	"go.opentelemetry.io/otel/attribute"
@@ -32,6 +33,7 @@ type hugePageAdmission struct {
 
 	mu         sync.Mutex
 	pendingMiB int64
+	budgetMiB  uint64
 }
 
 // hugePageShortage is a start the free pages cannot back.
@@ -76,9 +78,19 @@ func (a *hugePageAdmission) admit(ctx context.Context, ramMB int64) (func(), *hu
 
 	m, err := a.read(ctx)
 	if err != nil {
-		logger.L().Warn(ctx, "Cannot read the hugepage pool, admitting the start unchecked", zap.Error(err))
+		logger.L().Warn(ctx, "Cannot read the hugepage pool", zap.Error(err), zap.Bool("strict_admission", a.budgetMiB > 0))
 	}
 	free, ok := freeHugePages(m)
+	if a.budgetMiB > 0 {
+		if err != nil || m == nil || !m.HugePagesBaseRead || m.HugePageSizeBytes < 1<<20 || ramMB <= 0 || uint64(ramMB) > math.MaxUint64>>20 {
+			return nil, &hugePageShortage{ramMB: ramMB}
+		}
+		// Kernel reservations cover full mapped guest RAM, including untouched
+		// pages. Never count surplus or the kernel overcommit allowance.
+		ceiling := min(m.HugePagesBase, a.budgetMiB/(m.HugePageSizeBytes>>20))
+		committed := m.HugePagesUsed + m.HugePagesReserved
+		free, ok = ceiling-min(ceiling, committed), true
+	}
 	if err == nil && ok {
 		needed := hugePagesFor(ramMB, m.HugePageSizeBytes)
 		pending := hugePagesFor(a.pendingMiB, m.HugePageSizeBytes)
@@ -87,6 +99,10 @@ func (a *hugePageAdmission) admit(ctx context.Context, ramMB int64) (func(), *hu
 		}
 	}
 
+	if a.budgetMiB > 0 {
+		// Account each mapping's page rounding separately for mixed odd-MiB sizes.
+		ramMB = int64(hugePagesFor(ramMB, m.HugePageSizeBytes) * (m.HugePageSizeBytes >> 20))
+	}
 	return a.holdLocked(ramMB), nil
 }
 
@@ -124,7 +140,7 @@ func usesHugePages(sbx *sandbox.Sandbox) bool { return sbx.Config.HugePages }
 // was running at the pool read, as one that ended since may have returned
 // pages the read did not see.
 func (s *Server) admitHugePages(ctx context.Context, cfg *orchestrator.SandboxConfig) (func(), error) {
-	if s.hugePages == nil || !s.featureFlags.BoolFlag(ctx, featureflags.CreateHugePageAdmissionFlag) {
+	if s.hugePages == nil || (s.hugePages.budgetMiB == 0 && !s.featureFlags.BoolFlag(ctx, featureflags.CreateHugePageAdmissionFlag)) {
 		return func() {}, nil
 	}
 
@@ -149,7 +165,7 @@ func (s *Server) admitHugePages(ctx context.Context, cfg *orchestrator.SandboxCo
 		zap.Uint64("pending_pages", shortage.pendingPages),
 		zap.Int("stopping", stopping))
 
-	if stopping > 0 {
+	if stopping > 0 || s.hugePages.budgetMiB > 0 {
 		return nil, status.Errorf(codes.ResourceExhausted, "not enough free hugepages for %d MiB of guest memory while a sandbox is still stopping on this node, please retry", shortage.ramMB)
 	}
 
@@ -165,4 +181,17 @@ func (s *Server) holdHugePages(ctx context.Context, cfg *sandbox.Config) func() 
 	}
 
 	return s.hugePages.hold(cfg.RamMB)
+}
+
+// checkedHoldHugePages applies the same admission to internal resumes. Legacy
+// deployments retain upstream hold-only behavior; strict deployments cannot
+// bypass the budget through checkpoint or prefetch work.
+func (s *Server) checkedHoldHugePages(ctx context.Context, config *sandbox.Config) (func(), error) {
+	if s.hugePages == nil || s.hugePages.budgetMiB == 0 {
+		return s.holdHugePages(ctx, config), nil
+	}
+	if !config.HugePages {
+		return nil, status.Error(codes.FailedPrecondition, "strict memory admission requires hugepage-backed guests")
+	}
+	return s.admitHugePages(ctx, &orchestrator.SandboxConfig{RamMb: config.RamMB})
 }

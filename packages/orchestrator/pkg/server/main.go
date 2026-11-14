@@ -181,8 +181,14 @@ func New(ctx context.Context, cfg ServiceConfig) (*Server, error) {
 
 		buildDisk: newBuildDisk(cfg.Config.DefaultCacheDir, cfg.TemplateStorage),
 	}
+	if cfg.Config.MemoryBudgetMiB > 0 && cfg.HostMetrics == nil {
+		return nil, fmt.Errorf("MEMORY_BUDGET_MIB requires host memory metrics")
+	}
 	if cfg.HostMetrics != nil {
-		server.hugePages = &hugePageAdmission{read: cfg.HostMetrics.GetMemoryMetrics}
+		server.hugePages = &hugePageAdmission{read: cfg.HostMetrics.GetMemoryMetrics, budgetMiB: cfg.Config.MemoryBudgetMiB}
+		if cfg.Config.MemoryBudgetMiB > 0 {
+			server.hugePages.read = cfg.HostMetrics.ReadMemoryMetrics
+		}
 	}
 	server.shutdownCtx, server.shutdown = context.WithCancel(context.Background())
 	server.updateMaxSandboxesLimit(ctx)
