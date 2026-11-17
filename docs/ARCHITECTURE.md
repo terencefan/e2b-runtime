@@ -1364,6 +1364,11 @@ sequenceDiagram
 
 ### Template build
 
+The OCI import rootfs ceiling defaults to 51200 MiB (50 GiB), controlled by
+`build-base-rootfs-size-limit-mb`. This bounds the filesystem used to extract the
+base image, independently of the project limit on the build's requested free-disk
+space target (`minFreeDiskMb`); raising one does not raise the other.
+
 ```mermaid
 sequenceDiagram
     autonumber

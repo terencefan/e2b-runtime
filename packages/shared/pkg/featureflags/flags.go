@@ -888,7 +888,7 @@ var (
 	SandboxMaxIncomingConnections = NewIntFlag("sandbox-max-incoming-connections", -1)
 
 	// BuildBaseRootfsSizeLimitMB is the maximum size of the base rootfs filesystem created from the OCI image, in MB.
-	BuildBaseRootfsSizeLimitMB = NewIntFlag("build-base-rootfs-size-limit-mb", 25000)
+	BuildBaseRootfsSizeLimitMB = NewIntFlag("build-base-rootfs-size-limit-mb", 51200)
 
 	// ClientProxyResumeParkingBudgetMs gates the retries of one resume
 	// flight, counted from its first retryable failure and read when the
