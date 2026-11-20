@@ -5,6 +5,7 @@ package oci
 import (
 	"archive/tar"
 	"bytes"
+	"context"
 	"fmt"
 	"io"
 	"net/http"
@@ -520,4 +521,18 @@ func TestWrapImagePullErrorLogsTrustedProxyClassification(t *testing.T) {
 		require.Len(t, entries, 1)
 		assert.Equal(t, tc.want, entries[0].ContextMap()["dockerhub_proxy_access_denied"])
 	}
+}
+
+func TestUnmountBuildFilesystemPreservesFailure(t *testing.T) {
+	bin := t.TempDir()
+	require.NoError(t, os.WriteFile(filepath.Join(bin, "umount"), []byte("#!/bin/sh\nexit 32\n"), 0o700))
+	t.Setenv("PATH", bin)
+
+	ctx, cancel := context.WithCancel(t.Context())
+	cancel()
+	err := unmountBuildFilesystem(ctx, "ext4", "/unused-mountpoint")
+
+	require.ErrorIs(t, err, ErrMountCleanup)
+	require.ErrorContains(t, err, "exit status 32")
+	require.ErrorContains(t, err, "/unused-mountpoint")
 }

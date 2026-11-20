@@ -153,13 +153,16 @@ func (bb *BaseBuilder) buildLayerFromOCI(
 	userLogger logger.Logger,
 	baseMetadata metadata.Template,
 	hash string,
-) (metadata.Template, error) {
+) (_ metadata.Template, buildErr error) {
 	templateBuildDir := filepath.Join(bb.BuilderConfig.TemplatesDir, baseMetadata.Template.BuildID)
 	err := os.MkdirAll(templateBuildDir, 0o777)
 	if err != nil {
 		return metadata.Template{}, fmt.Errorf("error creating template build directory: %w", err)
 	}
 	defer func() {
+		if errors.Is(buildErr, oci.ErrMountCleanup) {
+			return
+		}
 		err := os.RemoveAll(templateBuildDir)
 		if err != nil {
 			bb.logger.Error(ctx, "Error while removing template build directory", zap.Error(err))

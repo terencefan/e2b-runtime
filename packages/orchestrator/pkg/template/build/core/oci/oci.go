@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/dustin/go-humanize"
 	"github.com/google/go-containerregistry/pkg/name"
@@ -32,6 +33,9 @@ import (
 	"github.com/e2b-dev/infra/packages/shared/pkg/units"
 	"github.com/e2b-dev/infra/packages/shared/pkg/utils"
 )
+
+// ErrMountCleanup indicates build files may still be in use by a mount.
+var ErrMountCleanup = errors.New("template mount cleanup failed")
 
 var tracer = otel.Tracer("github.com/e2b-dev/infra/packages/orchestrator/pkg/template/build/core/oci")
 
@@ -215,7 +219,7 @@ func ToExt4(ctx context.Context, logger logger.Logger, img containerregistry.Ima
 	return size, nil
 }
 
-func ExtractToExt4(ctx context.Context, l logger.Logger, img containerregistry.Image, rootfsPath string, maxSize int64) error {
+func ExtractToExt4(ctx context.Context, l logger.Logger, img containerregistry.Image, rootfsPath string, maxSize int64) (err error) {
 	ctx, childSpan := tracer.Start(ctx, "extract-to-ext4")
 	defer childSpan.End()
 
@@ -225,7 +229,10 @@ func ExtractToExt4(ctx context.Context, l logger.Logger, img containerregistry.I
 		return fmt.Errorf("error creating temporary mount point: %w", err)
 	}
 	defer func() {
-		if removeErr := os.RemoveAll(tmpMount); removeErr != nil {
+		if errors.Is(err, ErrMountCleanup) {
+			return
+		}
+		if removeErr := os.Remove(tmpMount); removeErr != nil {
 			logger.L().Error(ctx, "error removing temporary mount point", zap.Error(removeErr))
 		}
 	}()
@@ -235,9 +242,7 @@ func ExtractToExt4(ctx context.Context, l logger.Logger, img containerregistry.I
 		return fmt.Errorf("error mounting ext4 filesystem: %w", err)
 	}
 	defer func() {
-		if unmountErr := filesystem.Unmount(context.WithoutCancel(ctx), tmpMount); unmountErr != nil {
-			logger.L().Error(ctx, "error unmounting ext4 filesystem", zap.Error(unmountErr))
-		}
+		err = errors.Join(err, unmountBuildFilesystem(ctx, "ext4", tmpMount))
 	}()
 
 	logger.L().Debug(ctx, "extracting image to ext4 filesystem",
@@ -250,6 +255,29 @@ func ExtractToExt4(ctx context.Context, l logger.Logger, img containerregistry.I
 		return fmt.Errorf("error extracting tar to directory: %w", err)
 	}
 
+	return nil
+}
+
+func unmountBuildFilesystem(ctx context.Context, filesystemType, mountpoint string) error {
+	cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 10*time.Second)
+	defer cancel()
+	if err := filesystem.Unmount(cleanupCtx, mountpoint); err != nil {
+		namespace, _ := os.Readlink("/proc/self/ns/mnt")
+		mountInfo, _ := os.ReadFile("/proc/self/mountinfo")
+		var entries []string
+		for line := range strings.SplitSeq(string(mountInfo), "\n") {
+			if strings.Contains(line, mountpoint) {
+				entries = append(entries, line)
+			}
+		}
+		logger.L().Error(ctx, "template filesystem unmount failed",
+			zap.String("mountpoint", mountpoint),
+			zap.String("mount_namespace", namespace),
+			zap.Strings("mountinfo", entries),
+			zap.Error(err),
+		)
+		return fmt.Errorf("%w: unmount %s at %s: %w", ErrMountCleanup, filesystemType, mountpoint, err)
+	}
 	return nil
 }
 
@@ -282,6 +310,9 @@ func unpackRootfs(ctx context.Context, l logger.Logger, srcImage containerregist
 		return fmt.Errorf("while creating temporary file for squashed image: %w", err)
 	}
 	defer func() {
+		if errors.Is(err, ErrMountCleanup) {
+			return
+		}
 		if removeErr := os.RemoveAll(ociPath); removeErr != nil {
 			logger.L().Error(ctx, "error removing temporary OCI image", zap.Error(removeErr))
 		}
@@ -299,7 +330,10 @@ func unpackRootfs(ctx context.Context, l logger.Logger, srcImage containerregist
 		return fmt.Errorf("while creating temporary file for squashed image: %w", err)
 	}
 	defer func() {
-		if removeErr := os.RemoveAll(mountPath); removeErr != nil {
+		if errors.Is(err, ErrMountCleanup) {
+			return
+		}
+		if removeErr := os.Remove(mountPath); removeErr != nil {
 			logger.L().Error(ctx, "error removing temporary overlayfs mount point", zap.Error(removeErr))
 		}
 	}()
@@ -309,9 +343,7 @@ func unpackRootfs(ctx context.Context, l logger.Logger, srcImage containerregist
 		return fmt.Errorf("while mounting overlayfs with layers: %w", err)
 	}
 	defer func() {
-		if unmountErr := filesystem.Unmount(context.WithoutCancel(ctx), mountPath); unmountErr != nil {
-			logger.L().Error(ctx, "error unmounting overlayfs mount point", zap.Error(unmountErr))
-		}
+		err = errors.Join(err, unmountBuildFilesystem(ctx, "overlayfs", mountPath))
 	}()
 
 	// List files in the mount point
