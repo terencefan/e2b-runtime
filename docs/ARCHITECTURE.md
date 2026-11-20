@@ -1364,6 +1364,13 @@ sequenceDiagram
 
 ### Template build
 
+OCI imports use a short-lived worker in a private Linux mount namespace. The
+template manager prepares the OCI layers and ext4 backing file on disk. The
+worker owns the temporary overlay and ext4 mounts and unmounts them before
+returning. The manager checks and resizes the image only after the worker
+reports success and exits. A mount cleanup failure stops the import and
+preserves the build directory for diagnosis.
+
 The OCI import rootfs ceiling defaults to 51200 MiB (50 GiB), controlled by
 `build-base-rootfs-size-limit-mb`. This bounds the filesystem used to extract the
 base image, independently of the project limit on the build's requested free-disk

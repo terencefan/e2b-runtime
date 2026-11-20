@@ -7,6 +7,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"regexp"
@@ -116,11 +117,11 @@ func Unmount(ctx context.Context, rootfsPath string) error {
 	unmountStdoutWriter := telemetry.NewEventWriter(ctx, "stdout")
 	cmd.Stdout = unmountStdoutWriter
 
-	unmountStderrWriter := telemetry.NewEventWriter(ctx, "stderr")
-	cmd.Stderr = unmountStderrWriter
+	var stderr bytes.Buffer
+	cmd.Stderr = io.MultiWriter(telemetry.NewEventWriter(ctx, "stderr"), &stderr)
 
 	if err := cmd.Run(); err != nil {
-		return fmt.Errorf("error unmounting ext4 filesystem: %w", err)
+		return fmt.Errorf("error unmounting ext4 filesystem: %w: %s", err, stderr.String())
 	}
 
 	return nil

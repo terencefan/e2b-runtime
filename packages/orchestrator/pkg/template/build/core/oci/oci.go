@@ -223,6 +223,27 @@ func ExtractToExt4(ctx context.Context, l logger.Logger, img containerregistry.I
 	ctx, childSpan := tracer.Start(ctx, "extract-to-ext4")
 	defer childSpan.End()
 
+	ociPath, err := os.MkdirTemp(filepath.Dir(rootfsPath), ".oci-image-")
+	if err != nil {
+		return fmt.Errorf("create OCI staging directory: %w", err)
+	}
+	defer func() {
+		if !errors.Is(err, ErrMountCleanup) {
+			if cleanupErr := os.RemoveAll(ociPath); cleanupErr != nil {
+				logger.L().Error(ctx, "remove OCI staging directory", zap.Error(cleanupErr))
+			}
+		}
+	}()
+	layers, err := createExport(ctx, l, img, ociPath)
+	if err != nil {
+		return fmt.Errorf("export OCI layers: %w", err)
+	}
+	return runMountWorker(ctx, l, mountRequest{Rootfs: rootfsPath, Layers: layers, MaxSize: maxSize})
+}
+
+func populateExt4(ctx context.Context, request mountRequest, result *mountResult) (err error) {
+	rootfsPath := request.Rootfs
+
 	tempRoot := filepath.Dir(rootfsPath)
 	tmpMount, err := os.MkdirTemp(tempRoot, ".ext4-mount-")
 	if err != nil {
@@ -239,7 +260,7 @@ func ExtractToExt4(ctx context.Context, l logger.Logger, img containerregistry.I
 
 	err = filesystem.Mount(ctx, rootfsPath, tmpMount)
 	if err != nil {
-		return fmt.Errorf("error mounting ext4 filesystem: %w", err)
+		return fmt.Errorf("%w: mount ext4: %w", ErrMountCleanup, err)
 	}
 	defer func() {
 		err = errors.Join(err, unmountBuildFilesystem(ctx, "ext4", tmpMount))
@@ -250,12 +271,7 @@ func ExtractToExt4(ctx context.Context, l logger.Logger, img containerregistry.I
 		zap.String("tmp_mount", tmpMount),
 	)
 
-	err = unpackRootfs(ctx, l, img, tmpMount, tempRoot, maxSize)
-	if err != nil {
-		return fmt.Errorf("error extracting tar to directory: %w", err)
-	}
-
-	return nil
+	return mountAndCopy(ctx, request.Layers, tmpMount, tempRoot, request.MaxSize, result)
 }
 
 func unmountBuildFilesystem(ctx context.Context, filesystemType, mountpoint string) error {
@@ -270,13 +286,7 @@ func unmountBuildFilesystem(ctx context.Context, filesystemType, mountpoint stri
 				entries = append(entries, line)
 			}
 		}
-		logger.L().Error(ctx, "template filesystem unmount failed",
-			zap.String("mountpoint", mountpoint),
-			zap.String("mount_namespace", namespace),
-			zap.Strings("mountinfo", entries),
-			zap.Error(err),
-		)
-		return fmt.Errorf("%w: unmount %s at %s: %w", ErrMountCleanup, filesystemType, mountpoint, err)
+		return fmt.Errorf("%w: unmount %s at %s (namespace %s, mountinfo %q): %w", ErrMountCleanup, filesystemType, mountpoint, namespace, entries, err)
 	}
 	return nil
 }
@@ -301,29 +311,7 @@ func ParseEnvs(envs []string) map[string]string {
 	return envMap
 }
 
-func unpackRootfs(ctx context.Context, l logger.Logger, srcImage containerregistry.Image, destDir string, tempRoot string, maxSize int64) (err error) {
-	ctx, childSpan := tracer.Start(ctx, "unpack-rootfs")
-	defer childSpan.End()
-
-	ociPath, err := os.MkdirTemp(tempRoot, ".oci-image-")
-	if err != nil {
-		return fmt.Errorf("while creating temporary file for squashed image: %w", err)
-	}
-	defer func() {
-		if errors.Is(err, ErrMountCleanup) {
-			return
-		}
-		if removeErr := os.RemoveAll(ociPath); removeErr != nil {
-			logger.L().Error(ctx, "error removing temporary OCI image", zap.Error(removeErr))
-		}
-	}()
-
-	// Create export of layers in the temporary directory
-	layers, err := createExport(ctx, l, srcImage, ociPath)
-	if err != nil {
-		return fmt.Errorf("while creating export of source image: %w", err)
-	}
-
+func mountAndCopy(ctx context.Context, layers []string, destDir, tempRoot string, maxSize int64, result *mountResult) (err error) {
 	// Mount the overlay filesystem with the extracted layers
 	mountPath, err := os.MkdirTemp(tempRoot, ".overlayfs-mount-")
 	if err != nil {
@@ -340,7 +328,7 @@ func unpackRootfs(ctx context.Context, l logger.Logger, srcImage containerregist
 
 	err = filesystem.MountOverlayFS(ctx, layers, mountPath)
 	if err != nil {
-		return fmt.Errorf("while mounting overlayfs with layers: %w", err)
+		return fmt.Errorf("%w: mount overlayfs: %w", ErrMountCleanup, err)
 	}
 	defer func() {
 		err = errors.Join(err, unmountBuildFilesystem(ctx, "overlayfs", mountPath))
@@ -351,7 +339,7 @@ func unpackRootfs(ctx context.Context, l logger.Logger, srcImage containerregist
 	if err != nil {
 		return fmt.Errorf("while listing files in overlayfs: %w", err)
 	}
-	l.Info(ctx, "Root filesystem structure: "+strings.Join(files, ", "))
+	result.RootEntries = files
 
 	// Copy files from the overlayfs mount point to the destination directory
 	err = copyFiles(ctx, mountPath, destDir)
