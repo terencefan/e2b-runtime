@@ -416,6 +416,8 @@ func createExport(ctx context.Context, logger logger.Logger, srcImage containerr
 
 	layerPaths := make([]string, len(layers))
 	var eg errgroup.Group
+	// Always join started extractors before the caller can remove staging files.
+	defer func() { _ = eg.Wait() }()
 	for i, l := range layers {
 		digest, err := l.Digest()
 		if err != nil {

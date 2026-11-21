@@ -137,9 +137,17 @@ func MakeWritable(ctx context.Context, rootfsPath string) error {
 	cmd.Stdout = tuneStdoutWriter
 
 	tuneStderrWriter := telemetry.NewEventWriter(ctx, "stderr")
-	cmd.Stderr = tuneStderrWriter
+	var stderr bytes.Buffer
+	cmd.Stderr = io.MultiWriter(tuneStderrWriter, &stderr)
 
-	return cmd.Run()
+	if err := cmd.Run(); err != nil {
+		output := stderr.String()
+		if len(output) > 8192 {
+			output = output[len(output)-8192:]
+		}
+		return fmt.Errorf("tune2fs make writable: %w: %s", err, output)
+	}
+	return nil
 }
 
 func Enlarge(ctx context.Context, rootfsPath string, addSize int64) (int64, error) {

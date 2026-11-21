@@ -159,3 +159,12 @@ func TestParseReservedBlocks(t *testing.T) {
 		})
 	}
 }
+
+func TestMakeWritableReportsCommandFailure(t *testing.T) {
+	bin := t.TempDir()
+	require.NoError(t, os.WriteFile(filepath.Join(bin, "tune2fs"), []byte("#!/bin/sh\necho 'superblock diagnostic' >&2\nexit 1\n"), 0700))
+	t.Setenv("PATH", bin)
+	err := MakeWritable(t.Context(), "/unused-rootfs")
+	require.ErrorContains(t, err, "exit status 1")
+	require.ErrorContains(t, err, "superblock diagnostic")
+}
