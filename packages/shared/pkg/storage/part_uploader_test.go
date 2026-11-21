@@ -2,6 +2,8 @@ package storage
 
 import (
 	"cmp"
+	"crypto/sha256"
+	"encoding/base64"
 	"fmt"
 	"io"
 	"net/http"
@@ -72,7 +74,7 @@ func testPartUploaderContract(t *testing.T, adapter partUploaderTestAdapter) {
 }
 
 // recordUploadedPart handles a multipart PUT in a fake server: it records the
-// part number and body and replies with a per-part ETag, echoing the CRC32
+// part number and body and replies with a per-part ETag, echoing the SHA256
 // checksum back like S3 does (the body must be read first — the SDK may send
 // the checksum as an HTTP trailer).
 func recordUploadedPart(t *testing.T, recorder *partUploaderRecorder, w http.ResponseWriter, r *http.Request) {
@@ -80,9 +82,12 @@ func recordUploadedPart(t *testing.T, recorder *partUploaderRecorder, w http.Res
 
 	n, err := strconv.Atoi(r.URL.Query().Get("partNumber"))
 	require.NoError(t, err)
-	recorder.parts = append(recorder.parts, recordedPart{number: n, body: readAllString(t, r.Body)})
-	if c := cmp.Or(r.Header.Get("x-amz-checksum-crc32"), r.Trailer.Get("x-amz-checksum-crc32")); c != "" {
-		w.Header().Set("x-amz-checksum-crc32", c)
+	body := readAllString(t, r.Body)
+	recorder.parts = append(recorder.parts, recordedPart{number: n, body: body})
+	checksum := sha256.Sum256([]byte(body))
+	require.Equal(t, base64.StdEncoding.EncodeToString(checksum[:]), cmp.Or(r.Header.Get("x-amz-checksum-sha256"), r.Trailer.Get("x-amz-checksum-sha256")))
+	if c := cmp.Or(r.Header.Get("x-amz-checksum-sha256"), r.Trailer.Get("x-amz-checksum-sha256")); c != "" {
+		w.Header().Set("x-amz-checksum-sha256", c)
 	}
 	w.Header().Set("ETag", fmt.Sprintf(`"etag%d"`, n))
 	w.WriteHeader(http.StatusOK)

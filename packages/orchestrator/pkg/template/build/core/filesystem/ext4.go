@@ -7,6 +7,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"regexp"
@@ -116,11 +117,11 @@ func Unmount(ctx context.Context, rootfsPath string) error {
 	unmountStdoutWriter := telemetry.NewEventWriter(ctx, "stdout")
 	cmd.Stdout = unmountStdoutWriter
 
-	unmountStderrWriter := telemetry.NewEventWriter(ctx, "stderr")
-	cmd.Stderr = unmountStderrWriter
+	var stderr bytes.Buffer
+	cmd.Stderr = io.MultiWriter(telemetry.NewEventWriter(ctx, "stderr"), &stderr)
 
 	if err := cmd.Run(); err != nil {
-		return fmt.Errorf("error unmounting ext4 filesystem: %w", err)
+		return fmt.Errorf("error unmounting ext4 filesystem: %w: %s", err, stderr.String())
 	}
 
 	return nil
@@ -136,9 +137,17 @@ func MakeWritable(ctx context.Context, rootfsPath string) error {
 	cmd.Stdout = tuneStdoutWriter
 
 	tuneStderrWriter := telemetry.NewEventWriter(ctx, "stderr")
-	cmd.Stderr = tuneStderrWriter
+	var stderr bytes.Buffer
+	cmd.Stderr = io.MultiWriter(tuneStderrWriter, &stderr)
 
-	return cmd.Run()
+	if err := cmd.Run(); err != nil {
+		output := stderr.String()
+		if len(output) > 8192 {
+			output = output[len(output)-8192:]
+		}
+		return fmt.Errorf("tune2fs make writable: %w: %s", err, output)
+	}
+	return nil
 }
 
 func Enlarge(ctx context.Context, rootfsPath string, addSize int64) (int64, error) {

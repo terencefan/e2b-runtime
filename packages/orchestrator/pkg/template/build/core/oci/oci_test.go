@@ -5,14 +5,18 @@ package oci
 import (
 	"archive/tar"
 	"bytes"
+	"context"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"os/exec"
 	"path"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"testing"
 
 	"github.com/google/go-containerregistry/pkg/authn"
@@ -28,6 +32,7 @@ import (
 	"go.uber.org/zap"
 	"go.uber.org/zap/zaptest/observer"
 
+	"github.com/e2b-dev/infra/packages/orchestrator/pkg/template/build/core/filesystem"
 	"github.com/e2b-dev/infra/packages/orchestrator/pkg/template/build/core/oci/auth"
 	"github.com/e2b-dev/infra/packages/shared/pkg/dockerhub"
 	templatemanager "github.com/e2b-dev/infra/packages/shared/pkg/grpc/template-manager"
@@ -520,4 +525,57 @@ func TestWrapImagePullErrorLogsTrustedProxyClassification(t *testing.T) {
 		require.Len(t, entries, 1)
 		assert.Equal(t, tc.want, entries[0].ContextMap()["dockerhub_proxy_access_denied"])
 	}
+}
+
+func TestUnmountBuildFilesystemPreservesFailure(t *testing.T) {
+	bin := t.TempDir()
+	require.NoError(t, os.WriteFile(filepath.Join(bin, "umount"), []byte("#!/bin/sh\nexit 32\n"), 0o700))
+	t.Setenv("PATH", bin)
+
+	ctx, cancel := context.WithCancel(t.Context())
+	cancel()
+	err := unmountBuildFilesystem(ctx, "ext4", "/unused-mountpoint")
+
+	require.ErrorIs(t, err, ErrMountCleanup)
+	require.ErrorContains(t, err, "exit status 32")
+	require.ErrorContains(t, err, "/unused-mountpoint")
+}
+
+func TestMountWorkerRejectsSharedNamespace(t *testing.T) {
+	cmd := exec.CommandContext(t.Context(), "/proc/self/exe", mountWorkerArg)
+	cmd.Stdin = strings.NewReader("{}")
+	out, err := cmd.CombinedOutput()
+	require.Error(t, err)
+	require.Contains(t, string(out), "mount worker requires a separate mount namespace")
+}
+
+func TestMountWorkerCopiesAndUnmounts(t *testing.T) {
+	probe := exec.CommandContext(t.Context(), "/bin/true")
+	probe.SysProcAttr = &syscall.SysProcAttr{Cloneflags: syscall.CLONE_NEWNS}
+	if err := probe.Run(); err != nil {
+		if errors.Is(err, syscall.EPERM) {
+			t.Skip("mount namespace creation requires CAP_SYS_ADMIN")
+		}
+		require.NoError(t, err)
+	}
+	for _, command := range []string{"mount", "umount", "mkfs.ext4", "e2fsck", "rsync", "debugfs"} {
+		_, err := exec.LookPath(command)
+		require.NoError(t, err)
+	}
+	dir := t.TempDir()
+	layer := filepath.Join(dir, "layer")
+	require.NoError(t, os.Mkdir(layer, 0o755))
+	require.NoError(t, os.WriteFile(filepath.Join(layer, "example"), []byte(strings.Repeat("worker output", 1024)), 0o644))
+	emptyLayer := filepath.Join(dir, "empty-layer")
+	require.NoError(t, os.Mkdir(emptyLayer, 0o755))
+	rootfs := filepath.Join(dir, "rootfs")
+	require.NoError(t, filesystem.Make(t.Context(), rootfs, 64, 4096))
+	require.NoError(t, runMountWorker(t.Context(), logger.NewNopLogger(), mountRequest{
+		Rootfs: rootfs, Layers: []string{layer, emptyLayer}, MaxSize: 64 << 20,
+	}))
+	_, err := filesystem.CheckIntegrity(t.Context(), rootfs, false)
+	require.NoError(t, err)
+	out, err := exec.CommandContext(t.Context(), "debugfs", "-R", "cat /example", rootfs).Output()
+	require.NoError(t, err)
+	require.Equal(t, strings.Repeat("worker output", 1024), string(out))
 }

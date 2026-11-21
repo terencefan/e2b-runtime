@@ -38,6 +38,7 @@ func TestAWSPartUploader_PartUploaderContract(t *testing.T) {
 			client := newTestS3Client(t, func(w http.ResponseWriter, r *http.Request) {
 				switch {
 				case r.Method == http.MethodPost && r.URL.RawQuery == "uploads=":
+					require.Equal(t, "SHA256", r.Header.Get("x-amz-checksum-algorithm"))
 					recorder.started = true
 					w.WriteHeader(http.StatusOK)
 					w.Write([]byte(`<InitiateMultipartUploadResult><UploadId>contract-upload-id</UploadId></InitiateMultipartUploadResult>`))
@@ -53,8 +54,8 @@ func TestAWSPartUploader_PartUploaderContract(t *testing.T) {
 						t.Fatalf("complete upload parts not sorted: %+v", complete.Parts)
 					}
 					for _, p := range complete.Parts {
-						if p.ChecksumCRC32 == "" {
-							t.Fatalf("complete upload part %d missing CRC32 checksum", p.PartNumber)
+						if p.ChecksumSHA256 == "" {
+							t.Fatalf("complete upload part %d missing SHA256 checksum", p.PartNumber)
 						}
 					}
 					w.WriteHeader(http.StatusOK)
@@ -242,8 +243,8 @@ func TestAWSCompressedStoreFileEmptyFile(t *testing.T) {
 
 type completeMultipartUploadRequest struct {
 	Parts []struct {
-		PartNumber    int    `xml:"PartNumber"`
-		ChecksumCRC32 string `xml:"ChecksumCRC32"`
+		PartNumber     int    `xml:"PartNumber"`
+		ChecksumSHA256 string `xml:"ChecksumSHA256"`
 	} `xml:"Part"`
 }
 
@@ -290,7 +291,7 @@ func s3MetadataFromHeaders(h http.Header) map[string]string {
 //	  go test ./pkg/storage -run TestS3 -v -timeout 30m
 //
 // RustFS reimplements S3 semantics (5 MiB part minimum, multipart lifecycle,
-// CRC32 checksums) with high fidelity, but it is not AWS: real-S3 quirks like
+// SHA256 checksums) with high fidelity, but it is not AWS: real-S3 quirks like
 // metadata-key normalization and checksum-trailer validation should still be
 // verified against a real bucket before relying on them.
 // ---------------------------------------------------------------------------
@@ -418,7 +419,7 @@ func TestS3CompressedRoundTrip(t *testing.T) {
 
 // TestS3PartUploaderContract drives awsPartUploader directly against
 // real S3: out-of-order part numbers, a multi-slice part body (exercises
-// multiSliceReader's Seek for SDK payload hashing), CRC32 part checksums, and
+// multiSliceReader's Seek for SDK payload hashing), SHA256 part checksums, and
 // ordered reassembly on Complete. Real S3 enforces the 5 MiB non-final part
 // minimum and validates checksums, which the fake server does not.
 func TestS3PartUploaderContract(t *testing.T) {

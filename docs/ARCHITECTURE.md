@@ -1418,6 +1418,18 @@ sequenceDiagram
 
 ### Template build
 
+OCI imports use a short-lived worker in a private Linux mount namespace. The
+template manager prepares the OCI layers and ext4 backing file on disk. The
+worker owns the temporary overlay and ext4 mounts and unmounts them before
+returning. The manager checks and resizes the image only after the worker
+reports success and exits. A mount cleanup failure stops the import and
+preserves the build directory for diagnosis.
+
+The OCI import rootfs ceiling defaults to 51200 MiB (50 GiB), controlled by
+`build-base-rootfs-size-limit-mb`. This bounds the filesystem used to extract the
+base image, independently of the project limit on the build's requested free-disk
+space target (`minFreeDiskMb`); raising one does not raise the other.
+
 ```mermaid
 sequenceDiagram
     autonumber
@@ -1571,3 +1583,18 @@ Cross-service contracts are all generated: OpenAPI specs in `spec/`, gRPC protos
 `packages/orchestrator/*.proto`, `packages/scheduling-api/e2b/` and `packages/envd/spec/`, SQL in `packages/db/queries/`
 and `packages/scheduling-api/internal/db/queries/sql/`.
 Run `make generate` after changing any of them.
+
+## Canary S3 compatibility build
+
+This deployment build selects SHA256 for S3 PUT and multipart uploads, including compressed parts and completion checksums. This preserves transport integrity on S3-compatible endpoints that reject CRC32. It does not alter object keys, snapshot formats, access controls, or bucket lifecycle policy. The build is based on public commit fa14b81a9078a0c5ced0ed0623111774dac9539d and is identified separately from the official prebuilt binary.
+
+### OCI materialization with embedded OverlayFS data
+
+OCI imports stage and verify the original compressed layers in a build-private
+working directory. Before converting OCI whiteouts, the importer scans original
+tar headers for native character devices 0:0 and OverlayFS control xattrs.
+Conflicting images use ordered OCI layer application directly into the ext4
+mount inside the private mount worker. Other images retain overlay/rsync
+materialization. This avoids interpreting embedded Docker whiteout devices as
+control entries of the importer's own overlay mount. Neither path suppresses
+copy or cleanup failures. The staged files follow the build directory lifecycle.
