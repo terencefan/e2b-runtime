@@ -36,6 +36,7 @@ type Cluster struct {
 	Name                string
 	DeletionProtection  bool
 	DeletionRequestedAt *time.Time
+	TelemetryClientID   *string
 }
 
 type EnvAlias struct {
@@ -51,7 +52,6 @@ type EnvBuild struct {
 	CreatedAt          time.Time
 	UpdatedAt          time.Time
 	FinishedAt         *time.Time
-	Status             types.BuildStatus
 	Dockerfile         *string
 	StartCmd           *string
 	Vcpu               int64

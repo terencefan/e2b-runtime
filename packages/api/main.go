@@ -125,10 +125,6 @@ func NewGinServer(ctx context.Context, config cfg.Config, tel *telemetry.Client,
 
 	r.Use(gin.Recovery())
 
-	// Every secrets response is uncacheable, whichever layer answers. Must run
-	// before anything that can write a response.
-	r.Use(customMiddleware.NoStoreSecrets())
-
 	r.Use(
 		// We use custom otel gin middleware because we want to log 4xx errors in the otel
 		sharedmiddleware.ExcludeRoutes(
@@ -441,7 +437,7 @@ func run() int {
 	if err != nil {
 		l.Fatal(ctx, "failed to set up mutual TLS", zap.Error(err))
 	}
-	tlsConfig, err := newServiceTLS(tlsProcess, config.TLS, config.AnalyticsCollectorHost != "" && !config.AnalyticsCollectorTLS)
+	tlsConfig, err := newServiceTLS(tlsProcess, config.TLS, config.AnalyticsCollectorHost != "" && !config.AnalyticsCollectorTLS, false)
 	if err != nil {
 		l.Fatal(ctx, "invalid mutual TLS configuration", zap.Error(err))
 	}

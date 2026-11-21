@@ -85,6 +85,7 @@ type Cluster struct {
 	Name                string
 	DeletionProtection  bool
 	DeletionRequestedAt *time.Time
+	TelemetryClientID   pgtype.Text
 }
 
 type DefaultLimit struct {
@@ -133,7 +134,6 @@ type EnvBuild struct {
 	CreatedAt          time.Time
 	UpdatedAt          time.Time
 	FinishedAt         *time.Time
-	Status             string
 	Dockerfile         pgtype.Text
 	StartCmd           pgtype.Text
 	Vcpu               int64
@@ -333,6 +333,7 @@ type UsersTeam struct {
 	AddedBy   *uuid.UUID
 	CreatedAt pgtype.Timestamp
 	UuidID    uuid.UUID
+	Role      string
 }
 
 type Volume struct {

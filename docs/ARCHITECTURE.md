@@ -90,6 +90,7 @@ flowchart TB
 | Template manager | `packages/orchestrator` (role) | build nodes | Builds templates from Docker images |
 | Client proxy | `packages/client-proxy` | API nodes | Edge router: sandbox URL → correct node |
 | Envd | `packages/envd` | inside every VM | In-VM agent: process/filesystem API for SDKs |
+| Scheduling API | `packages/scheduling-api` | not deployed yet | gRPC scheduling service: actor lifecycle state (admission, start, pause and kill) in its own Postgres database, with transition waits; callers run node operations; one replica, chosen by a Postgres advisory lock, ends expired starts and purges old tombstones in the background; trusted maintenance methods list stale pauses and kills across projects and claim them for recovery; no callers yet |
 
 Supporting packages: `packages/shared` (protos, telemetry, storage clients, feature flags),
 `packages/auth` (authentication library), `packages/db` (Postgres migrations + sqlc queries),
@@ -121,6 +122,22 @@ image, which E2B Embed runs on port 3001 against the API alone.
   `audienceMatchPolicy`; this deliberately disables audience matching while issuer, signature,
   and temporal-claim verification remain required.
   Backed by an auth DB (Postgres) with a Redis team cache.
+- **Telemetry names**: `GET /unstable/management/telemetry/names` returns live cluster and
+  assigned-team display names from the regional database. Cluster registration projects the
+  telemetry client ID into `clusters.telemetry_client_id`, so collectors can resolve the verified
+  token subject without opening another database connection. The endpoint requires a direct
+  mutual TLS connection whose verified peer matches `TELEMETRY_READER_ID`; the HTTP listener
+  must also allow that identity. Bearer tokens and forwarded identity headers cannot authorize
+  name reads. An unset reader identity denies every request.
+- **Validation errors**: a request the OpenAPI validator refuses gets the first line of the
+  validator's message. For a body field it names the field and the rule it failed, not the value;
+  a parameter of a non-string type that cannot be parsed has its value quoted. The body of a
+  refused request is never logged. Fields that carry credentials (webhook signing secrets,
+  registry credentials, secret values) are marked `format: password` in the spec.
+- **Request URLs in telemetry**: the shared access log and tracing middleware record the route
+  template (e.g. `/sandboxes/:sandboxID`) instead of the path, and no query, so no value a client
+  put in the URL is recorded. A request that matches no route is recorded as `<unmatched route>`.
+  Handlers add the IDs worth recording, such as `sandbox.id`, as span attributes.
 - **API-group rate limits**: operations declare a group through the `x-api-group` OpenAPI
   extension. After authentication succeeds, its callback wrapper reads the validator's
   already-matched operation and stores the API group directly in Gin's context. The rate limiter
@@ -128,7 +145,7 @@ image, which E2B Embed runs on port 3001 against the API alone.
   require team-identifying authentication; public operations do not populate an API group.
   The `list` group uses `api_team_rps_list`; the `delete` group uses `api_team_rps_delete` only
   for sandbox and template deletion. Other DELETE operations are ungrouped.
-  Delete rates default to zero until configured.
+  The deployment defaults start at 10 list and 20 delete requests per second.
   A group's rate is one of the team's limits and resolves with the rest of them in the statement
   that loads the team, which authentication caches; it has no source of its own.
   Propagated project limits carry both rates, and each accepted revision replaces
@@ -182,7 +199,9 @@ image, which E2B Embed runs on port 3001 against the API alone.
   orchestrator in `SandboxConfig.iam`. The API mints no credential and delivers nothing into the
   sandbox; file-based delivery is rejected at admission. Definitions are persisted in the
   running-sandbox (Redis) and paused-snapshot (Postgres) state so they survive pause/resume and
-  orchestrator re-sync; a fork starts a new workload and does not inherit them.
+  orchestrator re-sync. A fork inherits them from the original's snapshot as a resume does, but
+  runs under its own sandbox ID and a fresh execution ID, so its tokens name the fork, never the
+  original.
 - **Placement**: keeps a live map of orchestrator nodes (discovered via Nomad, Kubernetes, or a
   static list). Chooses a node per sandbox with a **best-of-K** algorithm
   (`internal/orchestrator/placement/`): sample K ready nodes, score by the
@@ -229,7 +248,8 @@ image, which E2B Embed runs on port 3001 against the API alone.
   crosses that hop, and no response - here or in a log, a span or an error - carries a secret
   value. What a caller stores is a runtime marker, not a resolved secret; orchestrator-ee resolves
   a marker to a value at sandbox egress, never here. Without a configured address, or with the flag
-  off, the routes stay registered and answer 403. Responses are `Cache-Control: no-store`, request bodies are capped at 512 KiB, and values
+  off, the routes stay registered and answer 403. The handlers mark their responses
+  `Cache-Control: no-store`, request bodies are capped at 512 KiB, and values
   at 64 KiB. A create carries the cap on live secrets the backend enforces: `max_secrets` is one
   of the team's limits and resolves with the rest of them in the statement that loads the team (its
   `project_limits` value, else the deployment's `default_limits`).
@@ -244,8 +264,8 @@ image, which E2B Embed runs on port 3001 against the API alone.
   does not depend on how a deployment is wired. A backend failure the caller cannot act on is
   answered with the endpoint's own message; the outcomes that keep their identity are
   not-found, a rejected request, the webhook-count limit, and a timeout. A create or update
-  body carries the webhook's signing secret, so a request rejected before the handler has its
-  body kept out of the response, the access log and the span. Reads are capped at 100
+  body carries the webhook's signing secret; like every refused request's body, it is kept out
+  of the response, the access log and the span. Reads are capped at 100
   deliveries per page.
 - **Rig passthrough**: admin endpoints under `/clusters/{clusterID}/rigs` manage a cluster's
   orchestrator node pools ("rigs"). They list rigs, change rig capacity, list and terminate
@@ -260,14 +280,18 @@ image, which E2B Embed runs on port 3001 against the API alone.
 - **Extra listeners**: internal gRPC :5009 and edge gRPC :5109 expose `ResumeSandbox` so
   client-proxy can wake paused sandboxes on incoming traffic. The internal listener also
   serves `SandboxPlacementService` (`e2b.sandbox.placement.v1`) for the sandbox migration
-  manager: `GetSandboxPlacement` admits a move between two local nodes, `HoldExecution`
-  holds a running execution's record so pause, kill and timeout refuse it, and
-  `ResolveExecutionHold` moves the record to the target, releases it, or ends it. Only a
-  chain-verified caller named in `E2B_TLS_PLACEMENT_ALLOW` is served; the listener's own
-  allow-list is not enough, since client-proxy shares it. Every call is safe to repeat.
+  manager: `GetSandboxPlacement` admits a move between two local nodes and reports the
+  execution's network mode and whether managed volumes are attached, for the manager to
+  decide whether the sandbox can move. `HoldExecution` holds a running execution's record
+  so pause, kill and timeout refuse it, and `ResolveExecutionHold` moves the record to the
+  target, releases it, or ends it. Only a chain-verified caller named in
+  `E2B_TLS_PLACEMENT_ALLOW` is served; the listener's own allow-list is not enough, since
+  client-proxy shares it. Every call is safe to repeat.
 - **Node sandboxes**: admin `GET /nodes/{nodeID}/sandboxes` lists the sandboxes a node runs
   that the store records as running on it with the same execution, with the deadline of an
-  operation holding each, for the operator view that picks a sandbox to migrate.
+  operation holding each, its network mode and whether managed volumes are attached, for
+  the operator view that picks a sandbox to migrate. The migration manager decides whether
+  a sandbox can move.
 - **Outbox** (`internal/outbox`): a River client on the shared database's `river` schema
   works jobs that need the orchestrator connections. Its job arguments live in
   `packages/db/pkg/outbox`. `teardown_team_resources` stops a deleted
@@ -308,6 +332,12 @@ image, which E2B Embed runs on port 3001 against the API alone.
   defined there); a LaunchDarkly value wins. LaunchDarkly feature flags also gate placement
   parameters, rate limits, and rollouts.
 
+Administrators can update only an existing cluster's telemetry identity with
+`PUT /unstable/management/clusters/{clusterID}/telemetry`, authenticated using the
+existing admin service JWT. The update preserves credentials, endpoints, display
+names and assignments, refuses deleting or missing clusters, and retains the
+unique telemetry identity constraint.
+
 #### Project management writes (`/unstable/management`)
 
 `PUT /unstable/management/projects/{projectID}/settings` applies a revisioned settings
@@ -342,7 +372,10 @@ retries.
   per-project/user revision in `projection.project_members`; a duplicate or older revision
   succeeds without changing target state. A present projection carries the user's OIDC
   issuer/subject identities. Every projected user has at least one, and an identity already owned
-  by a different user returns 409. A revocation removes only that user's `users_teams` row;
+  by a different user returns 409. A present projection may carry the user's role (`owner` or
+  `member`), stored in `users_teams.role` and loaded with the team when a user session is
+  authenticated; an omitted role keeps the stored one, and a new member without one is stored as
+  `member`. Both roles grant the same access. A revocation removes only that user's `users_teams` row;
   projected users and identities are retained. Auth caches member authorization, so each accepted
   command evicts that user's authorization for the project after commit.
 - `PUT .../limits` syncs the project's effective limits into `project_limits`, which the team
@@ -437,9 +470,9 @@ The owning management service also drives a replay-safe cluster lifecycle under
 registers a stable cluster UUID, assigns it only to the named project, detaches that exact
 assignment before provider cleanup, and deletes the cluster only after no project references it.
 Replaying the same registration or assignment succeeds. Registering the cluster again with the same
-name and auth organization may change its endpoint, TLS setting, sandbox proxy domain and token, for
-example when the cluster moves to a new domain; the API rebuilds that cluster's clients on its next
-sync and gives sandboxes the new domain. A changed name or auth organization, a different
+auth organization preserves its stored display name and may change its endpoint, TLS setting, sandbox
+proxy domain and token, for example when the cluster moves to a new domain; the API rebuilds that cluster's clients on its next
+sync and gives sandboxes the new domain. A changed auth organization, a different
 assignment, an inexact detach, or deletion of a referenced cluster returns a conflict. The
 assignment does not check the project's tier; the caller decides which projects may use a cluster.
 A cluster first registered through this surface starts without deletion protection; one created any
@@ -517,7 +550,8 @@ by itself authorize node deletion.
 
 `InfoService.ServiceInfo.max_sandboxes` reports the cached node limit for every service role.
 Admin `/nodes` and `/nodes/{nodeID}` return required `maxSandboxes`, including zero. Admission,
-metrics, and node info share the value refreshed from node-scoped flags every 30 seconds.
+metrics, and node info share the value refreshed from node-scoped flags every 30 seconds. The
+flag's fallback reads `MAX_SANDBOXES_PER_NODE`.
 
 Key mechanisms (all under `pkg/sandbox/`):
 
@@ -574,7 +608,10 @@ Key mechanisms (all under `pkg/sandbox/`):
   handles before slot reuse. Physical root-descriptor cleanup runs independently and stays
   tracked by `nfs.retirements.gauge` until it finishes; a stuck backing operation does not
   retain the network slot. Pool shutdown removes retained networks while preserving failed
-  release-notification and teardown errors.
+  release-notification and teardown errors. It also removes the pooled ones, except that, when
+  startup reclaim is enabled, a reuse pool raised above its default
+  (`NETWORK_REUSED_SLOTS_POOL_SIZE`) stops at the shutdown's teardown deadline and leaves the
+  rest for that reclaim.
   The `/init` caller supplies NFS exports as `/lifecycle_id/volume_name`; the proxy
   checks the request lifecycle against the current IP route before MOUNT admission.
   This prevents a queued or retried old MOUNT from inheriting a reused IP's owner;
@@ -734,9 +771,21 @@ answers 408.
 | Store | Owner packages | What lives there |
 |---|---|---|
 | **PostgreSQL** | `packages/db` (goose migrations, sqlc) | Durable control-plane state: `teams`, `users`, `default_limits` (the one row of quota defaults), `project_limits` (per-team quota overrides pushed in by the owning service; the team lookups read it in preference to `default_limits`), `tiers` and `addons` (legacy; no limit is read from them), `envs` (templates), `env_builds` (build rows: vcpu, max_vcpu, ram_mb, status, versions; `max_vcpu` is NULL for a fixed-size build, else the VM capacity, while `vcpu` is the online count at start), `env_aliases`, `snapshots` (paused sandboxes), `team_api_keys`, `volumes`, `clusters` |
+| **Scheduling PostgreSQL** | `packages/scheduling-api` (goose migrations, own ledger `scheduling_migrations`, sqlc) | A separate database for actor state: `scheduling_actor` (record of a live sandbox), `scheduling_actor_run` (state, deadline, reservation, transition, failure, retry window), `scheduling_project_live_count` (live sandboxes per project, split over counter slots). Each replica uses one extra connection, outside its pool, to try the cleanup leader lock; only the leader keeps it open, with a 60 s idle session timeout so that PostgreSQL releases the lock of a failed leader. Not used by other services yet |
 | **Redis** | API, client-proxy, orchestrator | Ephemeral runtime state: running-sandbox store (source of truth), sandbox→node routing catalog, team/template/snapshot caches, rate limiting, P2P chunk peer registry |
 | **ClickHouse** | `packages/clickhouse` | Time-series/analytics: `metrics_gauge`/`metrics_sum` (written by the OTel collector), `sandbox_events`, `sandbox_host_stats` (written by orchestrator), team metrics, and optionally `sandbox_logs` during the log migration. Read by the API |
 | **Object storage** (GCS/S3/local, `packages/shared/pkg/storage`) | orchestrator, template-manager | Template & snapshot artifacts, keyed by build ID: `{buildID}/memfile`, `{buildID}/rootfs.ext4`, `{buildID}/snapfile`, `{buildID}/metadata.json` + `.header` index files |
+
+Scheduling PostgreSQL uses separate read and write pgx pools from one
+`SCHEDULING_DATABASE_URL`, with the same database, role and primary endpoint.
+The defaults allow 8 read and 24 write connections per service replica. Reads
+within a mutation transaction stay on the write pool.
+
+The scheduling listener requires mTLS by default. `E2B_TLS_GRPC_ALLOW` names
+the API SPIFFE identities allowed to call it. The shared TLS loader reads the
+certificate, key and CA bundle and reloads them every minute. Plaintext is
+limited to gRPC health probes. An isolated local run can explicitly set
+`E2B_TLS_GRPC_MODE=off`.
 
 The API's schema lives in `packages/db/migrations`, tracked in PostgreSQL's
 `_migrations` table. This includes `env_defaults`, which migration `20260915204740`
@@ -1234,7 +1283,12 @@ sequenceDiagram
   the build row records a failure the node may have gone on to complete.
 - **Fork**: checkpoints the original in place, then starts each fork from that snapshot as a
   new sandbox rather than a resume — like a sandbox created from a snapshot template — so
-  placement spreads the forks across nodes instead of preferring the original's node.
+  placement spreads the forks across nodes instead of preferring the original's node. Each fork
+  carries the configuration saved with that snapshot, as a resume does: metadata, internet
+  access, the network config including egress rules and their transforms, the workload-token
+  definitions, volume mounts, and the auto-pause and auto-resume settings. New for each fork are
+  the timeout from the fork request, its own sandbox ID, a fresh execution ID, and, for a secured
+  sandbox, an envd access token scoped to the fork.
 - **Filesystem-only checkpoint**: `memory: false` on snapshot-template creation exports the
   rootfs and no memfile, resumes the same Firecracker process, and produces a template whose
   sandboxes cold-boot; the source keeps running. Routed by its own flag,
@@ -1397,6 +1451,15 @@ sequenceDiagram
     API->>API: mark build ready in Postgres
 ```
 
+A template a build creates is private to its team unless the api runs with
+`TEMPLATES_DEFAULT_PUBLIC=true`; then it is public, so any team on the same cluster can start it by
+template ID or `<team-slug>/<alias>`. A rebuild keeps the visibility the template already has.
+
+The API sends each build to the least CPU-loaded of three eligible template builders sampled at
+random, scored from the host CPU use and allocated VM vCPUs each builder reports in `ServiceInfo`.
+A build's vCPUs count against the builder it was sent to for a minute, until the builder's own
+reports show its VMs, so a burst of builds between reports spreads instead of following one report.
+
 A build registered with a max CPU (`maxCpuCount`) is sent only to a template builder at or above
 the release that understands `maxVCpuCount`, and fails if none qualifies. A sandbox from a build
 with a non-null `max_vcpu` is placed only on orchestrators at that release. The pause path copies
@@ -1503,6 +1566,7 @@ packages/
   orchestrator/         Sandbox runtime + template builder (one binary, per-node)
   client-proxy/         Edge router for sandbox traffic
   envd/                 In-VM agent (pkg/version.go is release-please's; see Envd)
+  scheduling-api/       gRPC actor lifecycle state (admission, start, pause, kill, waits; no callers yet)
   shared/               Protos, telemetry, storage clients, proxy engine, feature flags
   auth/                 AuthN library (API keys, JWT/OIDC) used by api
   db/                   Postgres migrations (goose) + queries (sqlc)
@@ -1516,7 +1580,8 @@ embed/                  E2B Embed: the whole stack on one machine (Compose, Terr
 ```
 
 Cross-service contracts are all generated: OpenAPI specs in `spec/`, gRPC protos in
-`packages/orchestrator/*.proto` and `packages/envd/spec/`, SQL in `packages/db/queries/`.
+`packages/orchestrator/*.proto`, `packages/scheduling-api/e2b/` and `packages/envd/spec/`, SQL in `packages/db/queries/`
+and `packages/scheduling-api/internal/db/queries/sql/`.
 Run `make generate` after changing any of them.
 
 ## Canary S3 compatibility build

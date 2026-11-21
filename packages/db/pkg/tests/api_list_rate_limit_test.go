@@ -39,7 +39,6 @@ func TestAPIListRateResolvesDefaultsUntilPushed(t *testing.T) {
 
 		return row.ApiTeamRpsList
 	}
-	assert.Zero(t, resolved(teamID))
 	const largeRPS int64 = 1 << 32
 	_, err = sqlDB.ExecContext(t.Context(), `UPDATE public.default_limits SET api_team_rps_list = $1`, largeRPS)
 	require.NoError(t, err)
@@ -121,7 +120,7 @@ func TestProjectLimitsAPIListRateMigrationKeepsWhatAnEarlierRowResolvedTo(t *tes
 	_, err = sqlDB.ExecContext(t.Context(), `
 		INSERT INTO public.addons (team_id, name, extra_api_team_rps_list, valid_from, added_by)
 		VALUES ($1, 'active', 3, now() - interval '1 hour', $2)
-	`, teamID, uuid.Nil)
+	`, teamID, seedUser(t, sqlDB))
 	require.NoError(t, err)
 	_, err = sqlDB.ExecContext(t.Context(), `
 		INSERT INTO public.project_limits (
