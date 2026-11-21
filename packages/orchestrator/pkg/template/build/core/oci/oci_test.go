@@ -566,10 +566,12 @@ func TestMountWorkerCopiesAndUnmounts(t *testing.T) {
 	layer := filepath.Join(dir, "layer")
 	require.NoError(t, os.Mkdir(layer, 0o755))
 	require.NoError(t, os.WriteFile(filepath.Join(layer, "example"), []byte("worker output"), 0o644))
+	emptyLayer := filepath.Join(dir, "empty-layer")
+	require.NoError(t, os.Mkdir(emptyLayer, 0o755))
 	rootfs := filepath.Join(dir, "rootfs")
 	require.NoError(t, filesystem.Make(t.Context(), rootfs, 64, 4096))
 	require.NoError(t, runMountWorker(t.Context(), logger.NewNopLogger(), mountRequest{
-		Rootfs: rootfs, Layers: []string{layer}, MaxSize: 64 << 20,
+		Rootfs: rootfs, Layers: []string{layer, emptyLayer}, MaxSize: 64 << 20,
 	}))
 	_, err := filesystem.CheckIntegrity(t.Context(), rootfs, false)
 	require.NoError(t, err)
