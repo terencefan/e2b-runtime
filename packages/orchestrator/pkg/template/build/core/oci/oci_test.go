@@ -565,7 +565,7 @@ func TestMountWorkerCopiesAndUnmounts(t *testing.T) {
 	dir := t.TempDir()
 	layer := filepath.Join(dir, "layer")
 	require.NoError(t, os.Mkdir(layer, 0o755))
-	require.NoError(t, os.WriteFile(filepath.Join(layer, "example"), []byte("worker output"), 0o644))
+	require.NoError(t, os.WriteFile(filepath.Join(layer, "example"), []byte(strings.Repeat("worker output", 1024)), 0o644))
 	emptyLayer := filepath.Join(dir, "empty-layer")
 	require.NoError(t, os.Mkdir(emptyLayer, 0o755))
 	rootfs := filepath.Join(dir, "rootfs")
@@ -577,5 +577,5 @@ func TestMountWorkerCopiesAndUnmounts(t *testing.T) {
 	require.NoError(t, err)
 	out, err := exec.CommandContext(t.Context(), "debugfs", "-R", "cat /example", rootfs).Output()
 	require.NoError(t, err)
-	require.Equal(t, "worker output", string(out))
+	require.Equal(t, strings.Repeat("worker output", 1024), string(out))
 }
