@@ -234,7 +234,16 @@ func ExtractToExt4(ctx context.Context, l logger.Logger, img containerregistry.I
 			}
 		}
 	}()
-	layers, err := createExport(ctx, l, img, ociPath)
+	localImage, originals, sequential, err := stageOriginalLayers(ctx, img, ociPath)
+	if err != nil {
+		return fmt.Errorf("stage original OCI layers: %w", err)
+	}
+	if sequential {
+		l.Info(ctx, "materialization=sequential reason=overlay-control-content")
+		return runMountWorker(ctx, l, mountRequest{Rootfs: rootfsPath, OriginalLayers: originals, MaxSize: maxSize})
+	}
+	l.Info(ctx, "materialization=overlay")
+	layers, err := createExport(ctx, l, localImage, ociPath)
 	if err != nil {
 		return fmt.Errorf("export OCI layers: %w", err)
 	}
@@ -271,6 +280,9 @@ func populateExt4(ctx context.Context, request mountRequest, result *mountResult
 		zap.String("tmp_mount", tmpMount),
 	)
 
+	if len(request.OriginalLayers) > 0 {
+		return applyOriginalLayers(ctx, request.OriginalLayers, tmpMount)
+	}
 	return mountAndCopy(ctx, request.Layers, tmpMount, tempRoot, request.MaxSize, result)
 }
 

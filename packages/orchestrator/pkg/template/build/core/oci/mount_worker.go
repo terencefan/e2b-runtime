@@ -23,9 +23,10 @@ import (
 const mountWorkerArg = "__e2b_template_mount_worker"
 
 type mountRequest struct {
-	Rootfs  string
-	Layers  []string
-	MaxSize int64
+	OriginalLayers []string
+	Rootfs         string
+	Layers         []string
+	MaxSize        int64
 }
 
 type mountResult struct {

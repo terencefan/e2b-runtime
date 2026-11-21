@@ -1522,3 +1522,14 @@ Run `make generate` after changing any of them.
 ## Canary S3 compatibility build
 
 This deployment build selects SHA256 for S3 PUT and multipart uploads, including compressed parts and completion checksums. This preserves transport integrity on S3-compatible endpoints that reject CRC32. It does not alter object keys, snapshot formats, access controls, or bucket lifecycle policy. The build is based on public commit fa14b81a9078a0c5ced0ed0623111774dac9539d and is identified separately from the official prebuilt binary.
+
+### OCI materialization with embedded OverlayFS data
+
+OCI imports stage and verify the original compressed layers in a build-private
+working directory. Before converting OCI whiteouts, the importer scans original
+tar headers for native character devices 0:0 and OverlayFS control xattrs.
+Conflicting images use ordered OCI layer application directly into the ext4
+mount inside the private mount worker. Other images retain overlay/rsync
+materialization. This avoids interpreting embedded Docker whiteout devices as
+control entries of the importer's own overlay mount. Neither path suppresses
+copy or cleanup failures. The staged files follow the build directory lifecycle.
