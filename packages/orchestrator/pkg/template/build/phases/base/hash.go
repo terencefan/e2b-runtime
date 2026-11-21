@@ -34,7 +34,7 @@ func (bb *BaseBuilder) Hash(ctx context.Context, _ phases.LayerResult) (string, 
 		// when global caches are implemented.
 
 		// When building from image, use the image name
-		baseSource = bb.Config.FromImage
+		baseSource = bb.Config.FromImage + "\x00oci-materialization-v2"
 	}
 
 	// For fallback/dev environments, include baked rootfs file contents and
