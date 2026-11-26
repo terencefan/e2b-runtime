@@ -175,6 +175,7 @@ func TestPostV2TemplatesTemplateIDBuildsBuildIDMemoryMaximum(t *testing.T) {
 	}{
 		{"memory maximum needs a builder at its own floor", `,"memoryMB":1024,"maxMemoryMB":2048`, cpuFloor, http.StatusServiceUnavailable, nil, new(int64(1024))},
 		{"memory maximum is sent to the builder", `,"memoryMB":1024,"maxMemoryMB":2048`, memoryFloor, http.StatusAccepted, new(int32(2048)), new(int64(1024))},
+		{"omitted boot memory uses the 1024 MiB default", `,"maxMemoryMB":4096`, memoryFloor, http.StatusAccepted, new(int32(4096)), new(int64(1024))},
 		{"memory and CPU maximums need the higher floor", `,"memoryMB":1024,"maxMemoryMB":2048,"maxCpuCount":4`, cpuFloor, http.StatusServiceUnavailable, nil, new(int64(1024))},
 		{"maximum equal to memory is no region", `,"memoryMB":1024,"maxMemoryMB":1024`, "0.1.0", http.StatusAccepted, nil, nil},
 	} {
