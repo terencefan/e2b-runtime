@@ -169,18 +169,14 @@ func TestPostV2TemplatesTemplateIDBuildsBuildIDMemoryMaximum(t *testing.T) {
 		register string
 		builder  string
 		status   int
-		memoryMB int32
 		maxMem   *int32
 		// startMB is the start size the registered build row records.
 		startMB *int64
 	}{
-		{"memory maximum needs a builder at its own floor", `,"memoryMB":1024,"maxMemoryMB":2048`, cpuFloor, http.StatusServiceUnavailable, 1024, nil, new(int64(1024))},
-		{"explicit boot memory wins", `,"memoryMB":1024,"maxMemoryMB":4096`, memoryFloor, http.StatusAccepted, 1024, new(int32(4096)), new(int64(1024))},
-		{"omitted boot memory defaults to 1536 MiB for a 4 GiB maximum", `,"maxMemoryMB":4096`, memoryFloor, http.StatusAccepted, 1536, new(int32(4096)), new(int64(1536))},
-		{"small maximum preserves the upstream boot memory", `,"maxMemoryMB":1536`, memoryFloor, http.StatusAccepted, 1024, new(int32(1536)), new(int64(1024))},
-		{"memory and CPU maximums need the higher floor", `,"memoryMB":1024,"maxMemoryMB":2048,"maxCpuCount":4`, cpuFloor, http.StatusServiceUnavailable, 1024, nil, new(int64(1024))},
-		{"maximum equal to memory is no region", `,"memoryMB":1024,"maxMemoryMB":1024`, "0.1.0", http.StatusAccepted, 1024, nil, nil},
-		{"fixed template retains upstream default", "", "0.1.0", http.StatusAccepted, 1024, nil, nil},
+		{"memory maximum needs a builder at its own floor", `,"memoryMB":1024,"maxMemoryMB":2048`, cpuFloor, http.StatusServiceUnavailable, nil, new(int64(1024))},
+		{"memory maximum is sent to the builder", `,"memoryMB":1024,"maxMemoryMB":2048`, memoryFloor, http.StatusAccepted, new(int32(2048)), new(int64(1024))},
+		{"memory and CPU maximums need the higher floor", `,"memoryMB":1024,"maxMemoryMB":2048,"maxCpuCount":4`, cpuFloor, http.StatusServiceUnavailable, nil, new(int64(1024))},
+		{"maximum equal to memory is no region", `,"memoryMB":1024,"maxMemoryMB":1024`, "0.1.0", http.StatusAccepted, nil, nil},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
@@ -224,7 +220,7 @@ func TestPostV2TemplatesTemplateIDBuildsBuildIDMemoryMaximum(t *testing.T) {
 
 			created := client.created()
 			require.NotNil(t, created)
-			require.Equal(t, tt.memoryMB, created.GetMemoryMB())
+			require.Equal(t, int32(1024), created.GetMemoryMB())
 			require.Equal(t, tt.maxMem, created.MaxMemoryMB)
 		})
 	}

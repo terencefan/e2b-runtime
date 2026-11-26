@@ -1443,10 +1443,7 @@ Auto-resume, fork and a connect without `cpuCount` inherit the stored CPU count.
 Memory follows the same shape behind the same flag. A build registered with a max memory
 (`maxMemoryMB`, whole 128 MiB slots above `memoryMB`) gets a hotplug region from template
 builders at or above the release that understands it. The build records `max_ram_mb` and, as its
-start size, its boot RAM. In this fork, a new build that omits `memoryMB` and requests
-`maxMemoryMB` above 1536 MiB boots at 1536 MiB. Smaller maxima retain the upstream
-1024 MiB default to preserve their available growth. Explicit boot sizes and existing builds
-retain their configured size. Create, explicit resume and the v2 connect accept an optional
+start size, its boot RAM. Create, explicit resume and the v2 connect accept an optional
 `memoryMB`. On connect it follows `memory`: for a running sandbox the field is ignored and the
 sandbox keeps its size. For a paused one, the connect first refuses a size the snapshot or the
 team cannot take, as resume does, before it reserves the start, so a refused size never

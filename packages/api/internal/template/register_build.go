@@ -230,13 +230,7 @@ func registerBuild(
 		telemetry.SetAttributes(ctx, attribute.Int("env.max_memory_mb", int(*data.MaxMemoryMB)))
 	}
 
-	const defaultResizableBootMemoryMiB int32 = 1536
-	bootMemoryMB := data.MemoryMB
-	// Keep the upstream default for small maxima so existing builds can still grow.
-	if bootMemoryMB == nil && data.MaxMemoryMB != nil && *data.MaxMemoryMB > defaultResizableBootMemoryMiB {
-		bootMemoryMB = new(defaultResizableBootMemoryMiB)
-	}
-	cpuCount, ramMB, apiError := team.LimitResources(data.Team.Limits, data.CpuCount, bootMemoryMB)
+	cpuCount, ramMB, apiError := team.LimitResources(data.Team.Limits, data.CpuCount, data.MemoryMB)
 	if apiError != nil {
 		apiError.Retryable = apierrors.NoRetry
 
