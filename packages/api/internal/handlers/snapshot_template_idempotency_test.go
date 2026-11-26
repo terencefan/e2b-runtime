@@ -25,12 +25,12 @@ import (
 
 	"github.com/e2b-dev/infra/packages/api/internal/api"
 	templatecache "github.com/e2b-dev/infra/packages/api/internal/cache/templates"
+	"github.com/e2b-dev/infra/packages/api/internal/db/pkg/testutils"
 	custommiddleware "github.com/e2b-dev/infra/packages/api/internal/middleware"
 	"github.com/e2b-dev/infra/packages/api/internal/middleware/idempotency"
 	"github.com/e2b-dev/infra/packages/api/internal/orchestrator"
 	"github.com/e2b-dev/infra/packages/api/internal/sandbox"
 	"github.com/e2b-dev/infra/packages/auth/pkg/auth"
-	"github.com/e2b-dev/infra/packages/db/pkg/testutils"
 	"github.com/e2b-dev/infra/packages/shared/pkg/apierrors"
 	"github.com/e2b-dev/infra/packages/shared/pkg/featureflags"
 	"github.com/e2b-dev/infra/packages/shared/pkg/id"
@@ -257,7 +257,7 @@ func TestSnapshotIdempotencyReportsConcurrentDuplicates(t *testing.T) {
 	select {
 	case <-f.backend.started:
 	case w := <-owner:
-		t.Fatalf("snapshot finished before it was blocked: %d %s", w.Code, w.Body.String())
+		require.Failf(t, "snapshot finished before it was blocked", "%d %s", w.Code, w.Body.String())
 	}
 
 	duplicates := make(chan *httptest.ResponseRecorder, 4)

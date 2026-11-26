@@ -69,12 +69,16 @@ type Uffd struct {
 	// DiffMetadata can refuse the tracker dirty source for a WP_ASYNC
 	// sandbox instead of trusting the caller's comment-enforced precondition.
 	syncWP atomic.Bool
+
+	// memfdUnusedTail is how much of the end of Firecracker's memfd the guest cannot use, and
+	// the handshake leaves unmapped.
+	memfdUnusedTail atomic.Int64
 }
 
 var (
-	_ MemoryBackend     = (*Uffd)(nil)
-	_ CoWExporter       = (*Uffd)(nil)
-	_ PageStateReporter = (*Uffd)(nil)
+	_ MemoryBackend       = (*Uffd)(nil)
+	_ CoWExporter         = (*Uffd)(nil)
+	_ MemoryUsageReporter = (*Uffd)(nil)
 )
 
 // New builds a UFFD memory backend. lg is required and is expected to carry
@@ -88,6 +92,30 @@ func New(memfile block.ReadonlyDevice, socketPath string, lg logger.Logger) *Uff
 		handler:    *utils.NewSetOnce[*userfaultfd.Userfaultfd](),
 		fdExit:     *utils.NewSetOnce[*fdexit.FdExit](),
 		logger:     lg,
+	}
+}
+
+// SetMemfdUnusedTail sets how much of the end of the memfd the handshake leaves unmapped. It
+// must be set before the handshake.
+func (u *Uffd) SetMemfdUnusedTail(n int64) {
+	u.memfdUnusedTail.Store(n)
+}
+
+// ExtendMemfd maps more of the memfd, down to an unused tail of n bytes, before the guest runs.
+func (u *Uffd) ExtendMemfd(n int64) error {
+	m := u.memfd.Load()
+	if m == nil {
+		return nil
+	}
+
+	return m.Extend(n)
+}
+
+// SealMemfd fixes the memfd's mapping once the restore has applied the guest's hotplug size, so a
+// later ExtendMemfd is refused instead of replacing a mapping readers may hold.
+func (u *Uffd) SealMemfd() {
+	if m := u.memfd.Load(); m != nil {
+		m.Seal()
 	}
 }
 
@@ -274,10 +302,15 @@ func (u *Uffd) handle(ctx context.Context, fdExit *fdexit.FdExit) error {
 	}()
 
 	if len(fds) > 1 {
-		memfd, err := block.NewFromFd(fds[1])
+		tail := u.memfdUnusedTail.Load()
+		memfd, err := block.NewFromFdPrefix(fds[1], tail)
 		fds[1] = -1 // NewFromFd consumes the descriptor even on error.
 		if err != nil {
 			return fmt.Errorf("failed to wrap memfd: %w", err)
+		}
+		if !block.ValidUnusedTail(memfd.FileBytes(), tail) {
+			u.logger.Warn(ctx, "memfd unused tail does not fit the file, mapped it whole",
+				zap.Int64("unused_tail_bytes", tail), zap.Int64("file_bytes", memfd.FileBytes()))
 		}
 		u.memfd.Store(memfd)
 	}
@@ -492,15 +525,14 @@ func (u *Uffd) PeekMemfd(_ context.Context) *block.Memfd {
 	return u.memfd.Load()
 }
 
-// PageStateBytes returns the guest memory in each page-tracker state, in
-// bytes, and false until Firecracker has connected.
-func (u *Uffd) PageStateBytes() ([block.NumStates]int64, bool) {
+// MemoryUsage remains available after the handler closes, with its final total.
+func (u *Uffd) MemoryUsage() (block.MemoryUsage, bool) {
 	handler, err := u.handler.Result()
 	if err != nil {
-		return [block.NumStates]int64{}, false
+		return block.MemoryUsage{}, false
 	}
 
-	return handler.PageStateBytes(), true
+	return handler.MemoryUsage(), true
 }
 
 var _ BalloonModeLabeler = (*Uffd)(nil)

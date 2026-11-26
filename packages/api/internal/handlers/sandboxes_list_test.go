@@ -22,14 +22,14 @@ import (
 	analyticscollector "github.com/e2b-dev/infra/packages/api/internal/analytics_collector"
 	"github.com/e2b-dev/infra/packages/api/internal/api"
 	templatecache "github.com/e2b-dev/infra/packages/api/internal/cache/templates"
+	sqlcdb "github.com/e2b-dev/infra/packages/api/internal/db/client"
+	"github.com/e2b-dev/infra/packages/api/internal/db/pkg/testutils"
+	dbtypes "github.com/e2b-dev/infra/packages/api/internal/db/pkg/types"
+	"github.com/e2b-dev/infra/packages/api/internal/db/queries"
 	"github.com/e2b-dev/infra/packages/api/internal/sandbox"
 	"github.com/e2b-dev/infra/packages/api/internal/utils"
 	"github.com/e2b-dev/infra/packages/auth/pkg/auth"
 	authtypes "github.com/e2b-dev/infra/packages/auth/pkg/types"
-	sqlcdb "github.com/e2b-dev/infra/packages/db/client"
-	"github.com/e2b-dev/infra/packages/db/pkg/testutils"
-	dbtypes "github.com/e2b-dev/infra/packages/db/pkg/types"
-	"github.com/e2b-dev/infra/packages/db/queries"
 	"github.com/e2b-dev/infra/packages/shared/pkg/featureflags"
 	redis_utils "github.com/e2b-dev/infra/packages/shared/pkg/redis"
 	sharedutils "github.com/e2b-dev/infra/packages/shared/pkg/utils"
@@ -494,7 +494,7 @@ $$`)
 	case err := <-result:
 		require.ErrorIs(t, err, context.Canceled)
 	case <-time.After(5 * time.Second):
-		t.Fatal("sandbox list did not stop after cancellation")
+		require.Fail(t, "sandbox list did not stop after cancellation")
 	}
 	var attempts int
 	require.NoError(t, store.sqlcReadDB.Pool().QueryRow(t.Context(), "SELECT last_value FROM snapshot_read_attempt").Scan(&attempts))
@@ -525,7 +525,8 @@ END;
 $$;
 CREATE VIEW public.snapshots AS
 SELECT created_at, env_id, sandbox_id, id, metadata, base_env_id, sandbox_started_at,
-       env_secure, origin_node_id, allow_internet_access, auto_pause, team_id, config, env_deleted_at
+       env_secure, origin_node_id, allow_internet_access, auto_pause, team_id, config, env_deleted_at,
+       expires_at
 FROM public.snapshots_for_retry WHERE fail_snapshot_read();`)
 	require.NoError(t, err)
 	_, err = db.SqlcClient.Pool().Exec(ctx, "INSERT INTO snapshot_read_failure (failures, code, message) VALUES ($1, $2, $3)", failures, code, message)

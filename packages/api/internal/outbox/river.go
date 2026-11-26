@@ -1,6 +1,7 @@
 // Package outbox works the API's River jobs: the jobs another service enqueues
 // in the shared database for work only the API can do, because it holds the
-// orchestrator connections.
+// orchestrator connections, and the jobs the API enqueues with its own writes
+// to carry them to another service.
 package outbox
 
 import (
@@ -15,9 +16,10 @@ import (
 	"github.com/riverqueue/river/riverdriver/riverpgxv5"
 	"github.com/riverqueue/river/rivertype"
 
-	dbmodule "github.com/e2b-dev/infra/packages/db"
-	authdb "github.com/e2b-dev/infra/packages/db/pkg/auth"
-	"github.com/e2b-dev/infra/packages/db/pkg/outbox"
+	dbmodule "github.com/e2b-dev/infra/packages/api/internal/db"
+	authdb "github.com/e2b-dev/infra/packages/api/internal/db/pkg/auth"
+	"github.com/e2b-dev/infra/packages/api/internal/db/pkg/outbox"
+	webhooksgrpc "github.com/e2b-dev/infra/packages/shared/pkg/grpc/contracts/webhooks/management"
 	"github.com/e2b-dev/infra/packages/shared/pkg/logger"
 	"github.com/e2b-dev/infra/packages/shared/pkg/sharedriver"
 	"github.com/e2b-dev/infra/packages/shared/pkg/telemetry"
@@ -40,6 +42,7 @@ type Config struct {
 }
 
 type Dependencies struct {
+	Webhooks    webhooksgrpc.WebhookManagementServiceClient
 	Pool        *pgxpool.Pool
 	Sandboxes   teamSandboxes
 	Containment teamContainer
@@ -59,6 +62,15 @@ func New(deps Dependencies) (*River, error) {
 	steps := sharedriver.NewSteps(deps.Telemetry, deps.Logger, sharedriver.StepsConfig{MetricPrefix: "api"})
 
 	workers := river.NewWorkers()
+	// The leader rescues jobs from every queue, including ones it does not consume.
+	river.AddWorker(workers, &retireProjectWebhooksWorker{
+		client: deps.Webhooks,
+		steps:  steps.Job(outbox.RetireProjectWebhooks{}.Kind()),
+	})
+	queues := map[string]river.QueueConfig{river.QueueDefault: {MaxWorkers: deps.Config.MaxWorkers}}
+	if deps.Webhooks != nil {
+		queues[outbox.WebhookRetirementQueue] = river.QueueConfig{MaxWorkers: 1}
+	}
 	river.AddWorker(workers, &teamResourcesTeardownWorker{
 		sandboxes: deps.Sandboxes,
 		teams:     deps.Teams,
@@ -71,10 +83,9 @@ func New(deps Dependencies) (*River, error) {
 		settle:    containSettleDelay,
 		steps:     steps.Job(outbox.ContainBannedTeam{}.Kind()),
 	})
-
 	client, err := river.NewClient(riverpgxv5.New(deps.Pool), &river.Config{
 		Schema:               dbmodule.RiverSchema,
-		Queues:               map[string]river.QueueConfig{river.QueueDefault: {MaxWorkers: deps.Config.MaxWorkers}},
+		Queues:               queues,
 		Workers:              workers,
 		Plugins:              []rivertype.Plugin{sharedriver.NewOTelMiddleware(deps.Telemetry)},
 		Middleware:           []rivertype.Middleware{sharedriver.NewOutboxJobTelemetry(deps.Telemetry, deps.Logger)},
@@ -89,10 +100,9 @@ func New(deps Dependencies) (*River, error) {
 	if err != nil {
 		return nil, fmt.Errorf("create river client: %w", err)
 	}
-
 	backlog, err := sharedriver.NewBacklog(deps.Pool, deps.Telemetry, deps.Logger, sharedriver.BacklogConfig{
 		Schema:   dbmodule.RiverSchema,
-		Kinds:    []string{outbox.TeardownTeamResources{}.Kind(), outbox.ContainBannedTeam{}.Kind()},
+		Kinds:    []string{outbox.TeardownTeamResources{}.Kind(), outbox.RetireProjectWebhooks{}.Kind(), outbox.ContainBannedTeam{}.Kind()},
 		Interval: deps.Config.BacklogInterval,
 	})
 	if err != nil {

@@ -5,134 +5,46 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
-	"strings"
+	"time"
 
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
-	openapi_types "github.com/oapi-codegen/runtime/types"
 	"go.opentelemetry.io/otel/attribute"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 
 	"github.com/e2b-dev/infra/packages/api/internal/api"
-	"github.com/e2b-dev/infra/packages/db/pkg/dberrors"
-	"github.com/e2b-dev/infra/packages/db/queries"
+	"github.com/e2b-dev/infra/packages/api/internal/clusterassign"
+	sqlcdb "github.com/e2b-dev/infra/packages/api/internal/db/client"
 	"github.com/e2b-dev/infra/packages/shared/pkg/apierrors"
 	"github.com/e2b-dev/infra/packages/shared/pkg/consts"
-	"github.com/e2b-dev/infra/packages/shared/pkg/ginutils"
+	clustersgrpc "github.com/e2b-dev/infra/packages/shared/pkg/grpc/contracts/clusters/management"
 	"github.com/e2b-dev/infra/packages/shared/pkg/telemetry"
 )
 
-const (
-	clusterRegistrationInvalidCode       = "cluster_registration_invalid"
-	clusterRegistrationConflictCode      = "cluster_registration_conflict"
-	clusterAssignmentInvalidCode         = "cluster_assignment_invalid"
-	clusterAssignmentProjectNotFoundCode = "cluster_assignment_project_not_found"
-	clusterAssignmentClusterNotFoundCode = "cluster_assignment_cluster_not_found"
-	clusterAssignmentAlreadyAssignedCode = "cluster_assignment_already_assigned"
-	clusterAssignmentClusterDeletingCode = "cluster_assignment_cluster_deleting"
-)
-
 var (
-	errInvalidClusterRegistration = errors.New("invalid cluster registration")
-	errLocalClusterDeletion       = errors.New("the local cluster cannot be deleted")
-	errProtectedClusterDeletion   = errors.New("the cluster has deletion protection")
+	errLocalClusterDeletion     = errors.New("the local cluster cannot be deleted")
+	errProtectedClusterDeletion = errors.New("the cluster has deletion protection")
+	errClusterInUse             = errors.New("a project still references the cluster")
 )
 
-type clusterRegistration struct {
-	TelemetryClientID  *string
-	ClusterID          *uuid.UUID
-	Name               string
-	Endpoint           string
-	EndpointTLS        bool
-	Token              string
-	SandboxProxyDomain *string
-	AuthOrgID          *string
-	DeletionProtection bool
-	RefreshToken       bool
+func (a *APIStore) ManagementDeleteCluster(c *gin.Context, clusterID api.ClusterID) {
+	a.managementRemoveCluster(c, clusterID, false)
 }
 
-func (a *APIStore) ManagementRegisterCluster(c *gin.Context, clusterID api.ClusterID) {
+func (a *APIStore) ManagementRemoveClusterRegistration(c *gin.Context, clusterID api.ClusterID) {
+	a.managementRemoveCluster(c, clusterID, true)
+}
+
+func (a *APIStore) managementRemoveCluster(c *gin.Context, clusterID uuid.UUID, orphanProjects bool) {
 	ctx := c.Request.Context()
 	attrs := []attribute.KeyValue{telemetry.WithClusterID(clusterID)}
 
-	body, err := ginutils.ParseBody[api.ManagementClusterRegistrationRequest](ctx, c)
-	if err != nil {
-		telemetry.ReportErrorByCode(ctx, http.StatusBadRequest, "register cluster failed", err, attrs...)
-		apierrors.SendAPIError(c, &apierrors.APIError{Code: http.StatusBadRequest, ErrorCode: clusterRegistrationInvalidCode, ClientMsg: "Invalid cluster registration"})
-
+	if !a.requireClusterService(c) {
 		return
 	}
 
-	_, err = a.createCluster(ctx, clusterRegistration{
-		ClusterID:          &clusterID,
-		Name:               body.Name,
-		Endpoint:           body.Endpoint,
-		EndpointTLS:        body.EndpointTls,
-		Token:              body.Token,
-		SandboxProxyDomain: body.SandboxProxyDomain,
-		AuthOrgID:          body.AuthOrgId,
-		TelemetryClientID:  body.TelemetryClientId,
-		// An authorized replacement keeps the descriptor and assignments but
-		// generates a new edge credential. Generic admin creation stays strict.
-		RefreshToken: true,
-		// A cluster registered through the management API belongs to a
-		// deployment its caller also tears down, so it starts unprotected.
-		// Registering an existing cluster again keeps its stored protection.
-		DeletionProtection: false,
-	})
-	switch {
-	case errors.Is(err, errInvalidClusterRegistration):
-		telemetry.ReportErrorByCode(ctx, http.StatusBadRequest, "register cluster failed", err, attrs...)
-		apierrors.SendAPIError(c, &apierrors.APIError{Code: http.StatusBadRequest, ErrorCode: clusterRegistrationInvalidCode, ClientMsg: "Invalid cluster registration"})
-	case dberrors.IsUniqueConstraintViolation(err), dberrors.IsNotFoundError(err):
-		telemetry.ReportErrorByCode(ctx, http.StatusConflict, "register cluster failed", err, attrs...)
-		apierrors.SendAPIError(c, &apierrors.APIError{Code: http.StatusConflict, ErrorCode: clusterRegistrationConflictCode, ClientMsg: "Cluster conflicts with stored state"})
-	case err != nil:
-		telemetry.ReportCriticalError(ctx, "register cluster failed", err, attrs...)
-		a.sendAPIStoreError(c, http.StatusInternalServerError, "Failed to register cluster")
-	default:
-		c.Status(http.StatusNoContent)
-	}
-}
-
-// createCluster stores a new cluster, or answers for an existing one with the
-// same ID when its configuration matches. Without RefreshToken the token is
-// part of that configuration; with it, a matching cluster takes the new token
-// and connection details.
-func (a *APIStore) createCluster(ctx context.Context, registration clusterRegistration) (uuid.UUID, error) {
-	registration.Name = strings.TrimSpace(registration.Name)
-	registration.Endpoint = strings.TrimSpace(registration.Endpoint)
-	registration.Token = strings.TrimSpace(registration.Token)
-	registration.SandboxProxyDomain = trimmedOptional(registration.SandboxProxyDomain)
-	registration.AuthOrgID = trimmedOptional(registration.AuthOrgID)
-	registration.TelemetryClientID = trimmedOptional(registration.TelemetryClientID)
-	if registration.Name == "" || registration.Endpoint == "" || registration.Token == "" ||
-		registration.ClusterID != nil && *registration.ClusterID == uuid.Nil {
-		return uuid.Nil, errInvalidClusterRegistration
-	}
-
-	params := queries.CreateClusterParams{
-		ClusterID:          registration.ClusterID,
-		Name:               registration.Name,
-		Endpoint:           registration.Endpoint,
-		EndpointTls:        registration.EndpointTLS,
-		Token:              registration.Token,
-		SandboxProxyDomain: registration.SandboxProxyDomain,
-		AuthOrgID:          registration.AuthOrgID,
-		TelemetryClientID:  registration.TelemetryClientID,
-		DeletionProtection: registration.DeletionProtection,
-	}
-	if registration.RefreshToken {
-		return a.sqlcDB.RegisterManagedCluster(ctx, queries.RegisterManagedClusterParams(params))
-	}
-
-	return a.sqlcDB.CreateCluster(ctx, params)
-}
-
-func (a *APIStore) ManagementDeleteCluster(c *gin.Context, clusterID api.ClusterID) {
-	ctx := c.Request.Context()
-	attrs := []attribute.KeyValue{telemetry.WithClusterID(clusterID)}
-
-	err := a.deleteCluster(ctx, clusterID)
+	err := a.deleteCluster(ctx, clusterID, orphanProjects)
 	switch {
 	case errors.Is(err, errLocalClusterDeletion):
 		telemetry.ReportErrorByCode(ctx, http.StatusBadRequest, "delete cluster failed", err, attrs...)
@@ -140,9 +52,12 @@ func (a *APIStore) ManagementDeleteCluster(c *gin.Context, clusterID api.Cluster
 	case errors.Is(err, errProtectedClusterDeletion):
 		telemetry.ReportErrorByCode(ctx, http.StatusConflict, "delete cluster failed", err, attrs...)
 		a.sendAPIStoreError(c, http.StatusConflict, "Cluster has deletion protection turned on")
-	case dberrors.IsForeignKeyViolation(err):
+	case errors.Is(err, errClusterInUse):
 		telemetry.ReportErrorByCode(ctx, http.StatusConflict, "delete cluster failed", err, attrs...)
-		a.sendAPIStoreError(c, http.StatusConflict, "Cluster is still referenced by a team or environment")
+		a.sendAPIStoreError(c, http.StatusConflict, "Cluster is still referenced by a project")
+	case status.Code(err) == codes.Unavailable:
+		telemetry.ReportError(ctx, "delete cluster temporarily unavailable", err, attrs...)
+		apierrors.SendAPIError(c, &apierrors.APIError{Code: http.StatusServiceUnavailable, ClientMsg: "Retry the cluster deletion", Retryable: apierrors.CanRetry})
 	case err != nil:
 		telemetry.ReportCriticalError(ctx, "delete cluster failed", err, attrs...)
 		a.sendAPIStoreError(c, http.StatusInternalServerError, "Failed to delete cluster")
@@ -151,10 +66,17 @@ func (a *APIStore) ManagementDeleteCluster(c *gin.Context, clusterID api.Cluster
 	}
 }
 
-// deleteCluster soft-deletes the cluster's environments and removes the
-// cluster in one transaction. A team still assigned to the cluster fails the
-// final delete on its foreign key, which rolls the environments back too.
-func (a *APIStore) deleteCluster(ctx context.Context, clusterID uuid.UUID) error {
+// clusterDeleteTimeout bounds a cluster delete, which runs detached from the
+// request: a caller that leaves must not end it after the cluster service has
+// removed the record but before the templates are released.
+const clusterDeleteTimeout = time.Minute
+
+// deleteCluster refuses a protected cluster. Then, in one transaction holding
+// the cluster's assignment lock, it refuses a cluster a live team uses,
+// releases the cluster's templates and has the cluster service remove the
+// record. An assignment requested meanwhile waits and is then refused. An
+// absent cluster still has its templates released.
+func (a *APIStore) deleteCluster(ctx context.Context, clusterID uuid.UUID, orphanProjects bool) error {
 	// The local cluster's teams and environments store a NULL cluster_id. The
 	// queries below match by equality, which never selects NULL, and its nil ID
 	// is refused outright so a request for it never reaches them.
@@ -162,30 +84,91 @@ func (a *APIStore) deleteCluster(ctx context.Context, clusterID uuid.UUID) error
 		return errLocalClusterDeletion
 	}
 
-	txDB, tx, err := a.sqlcDB.WithTx(ctx)
+	cluster, err := a.lookUpCluster(ctx, &clusterID)
 	if err != nil {
-		return fmt.Errorf("begin cluster deletion: %w", err)
+		return fmt.Errorf("read cluster: %w", err)
 	}
-	defer func() { _ = tx.Rollback(context.WithoutCancel(ctx)) }()
-
-	protected, err := txDB.ClusterDeletionProtected(ctx, clusterID)
-	if err != nil {
-		return fmt.Errorf("check cluster deletion protection: %w", err)
-	}
-	if protected {
+	if cluster.GetDeletionProtection() {
 		return errProtectedClusterDeletion
 	}
 
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), clusterDeleteTimeout)
+	defer cancel()
+	if orphanProjects {
+		return a.removeCluster(ctx, clusterID, true)
+	}
+	txDB, tx, err := a.sqlcDB.WithTx(ctx)
+	if err != nil {
+		return fmt.Errorf("begin cluster delete: %w", err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	if err := clusterassign.Lock(ctx, tx, clusterID); err != nil {
+		return err
+	}
+	teamIDs, err := txDB.ListClusterTeamIDs(ctx, clusterID)
+	if err != nil {
+		return fmt.Errorf("list cluster teams: %w", err)
+	}
+	if len(teamIDs) > 0 {
+		return errClusterInUse
+	}
+	if err := releaseClusterTemplates(ctx, txDB, clusterID); err != nil {
+		return err
+	}
+	if cluster != nil {
+		if err := a.removeCluster(ctx, clusterID, false); err != nil {
+			return err
+		}
+		// A sandbox still running on the cluster may have recorded a template
+		// while the cluster service worked.
+		if err := releaseClusterTemplates(ctx, txDB, clusterID); err != nil {
+			return err
+		}
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return fmt.Errorf("commit cluster delete: %w", err)
+	}
+
+	return nil
+}
+
+// removeCluster records the cluster's deletion with the cluster service before
+// having it remove the record, so a removal that fails, or that completes
+// after the caller gave up on it, still leaves every later assignment refused.
+func (a *APIStore) removeCluster(ctx context.Context, clusterID uuid.UUID, orphanProjects bool) error {
+	if err := a.recordClusterDeletion(ctx, clusterID); err != nil {
+		return err
+	}
+
+	_, err := a.clusterService.DeleteCluster(ctx, clustersgrpc.DeleteClusterRequest_builder{ClusterId: clusterID.String(), OrphanProjects: orphanProjects}.Build())
+	switch clusterErrorReason(err) {
+	case clustersgrpc.ClusterErrorReason_CLUSTER_ERROR_REASON_DELETION_PROTECTED:
+		return errProtectedClusterDeletion
+	case clustersgrpc.ClusterErrorReason_CLUSTER_ERROR_REASON_IN_USE:
+		return errClusterInUse
+	}
+	if err != nil {
+		return fmt.Errorf("delete cluster: %w", err)
+	}
+
+	return nil
+}
+
+// releaseClusterTemplates soft-deletes the cluster's live templates and clears
+// the cluster from deleted teams and templates, so no row points at it once it
+// is deleted.
+func releaseClusterTemplates(ctx context.Context, txDB *sqlcdb.Client, clusterID uuid.UUID) error {
 	envIDs, err := txDB.SoftDeleteClusterEnvironments(ctx, clusterID)
 	if err != nil {
-		return fmt.Errorf("soft delete cluster environments: %w", err)
+		return fmt.Errorf("soft delete cluster templates: %w", err)
 	}
 	if len(envIDs) > 0 {
 		if err := txDB.ReleaseEnvironmentsAliases(ctx, envIDs); err != nil {
-			return fmt.Errorf("release cluster environment aliases: %w", err)
+			return fmt.Errorf("release cluster template aliases: %w", err)
 		}
 		if err := txDB.DeleteEnvironmentsActiveBuilds(ctx, envIDs); err != nil {
-			return fmt.Errorf("delete cluster environment active builds: %w", err)
+			return fmt.Errorf("delete cluster template active builds: %w", err)
 		}
 	}
 	if err := txDB.DetachDeletedTemplatesFromCluster(ctx, clusterID); err != nil {
@@ -193,12 +176,6 @@ func (a *APIStore) deleteCluster(ctx context.Context, clusterID uuid.UUID) error
 	}
 	if err := txDB.DetachDeletedTeamsFromCluster(ctx, clusterID); err != nil {
 		return fmt.Errorf("detach deleted teams: %w", err)
-	}
-	if _, err := txDB.DeleteCluster(ctx, clusterID); err != nil {
-		return fmt.Errorf("delete cluster: %w", err)
-	}
-	if err := tx.Commit(ctx); err != nil {
-		return fmt.Errorf("commit cluster deletion: %w", err)
 	}
 
 	return nil
@@ -225,6 +202,10 @@ func (a *APIStore) ManagementRequestClusterDeletion(c *gin.Context, clusterID ap
 	ctx := c.Request.Context()
 	attrs := []attribute.KeyValue{telemetry.WithClusterID(clusterID)}
 
+	if !a.requireClusterService(c) {
+		return
+	}
+
 	err := a.requestClusterDeletion(ctx, clusterID)
 	switch {
 	case errors.Is(err, errLocalClusterDeletion):
@@ -233,6 +214,9 @@ func (a *APIStore) ManagementRequestClusterDeletion(c *gin.Context, clusterID ap
 	case errors.Is(err, errProtectedClusterDeletion):
 		telemetry.ReportErrorByCode(ctx, http.StatusConflict, "request cluster deletion failed", err, attrs...)
 		a.sendAPIStoreError(c, http.StatusConflict, "Cluster has deletion protection turned on")
+	case status.Code(err) == codes.Unavailable:
+		telemetry.ReportError(ctx, "record cluster deletion temporarily unavailable", err, attrs...)
+		apierrors.SendAPIError(c, &apierrors.APIError{Code: http.StatusServiceUnavailable, ClientMsg: "Retry the cluster deletion", Retryable: apierrors.CanRetry})
 	case err != nil:
 		telemetry.ReportCriticalError(ctx, "request cluster deletion failed", err, attrs...)
 		a.sendAPIStoreError(c, http.StatusInternalServerError, "Failed to record cluster deletion")
@@ -241,35 +225,35 @@ func (a *APIStore) ManagementRequestClusterDeletion(c *gin.Context, clusterID ap
 	}
 }
 
-// requestClusterDeletion records, under the cluster row's lock, that the
-// cluster is being deleted. A protection change in flight commits first and is
-// seen here; once recorded, a check constraint refuses turning protection on.
+// requestClusterDeletion records that the cluster is being deleted. Once it
+// returns, no team is newly assigned to the cluster: an assignment in flight
+// has committed, and every later one is refused.
 func (a *APIStore) requestClusterDeletion(ctx context.Context, clusterID uuid.UUID) error {
 	if clusterID == consts.LocalClusterID {
 		return errLocalClusterDeletion
 	}
-
-	txDB, tx, err := a.sqlcDB.WithTx(ctx)
-	if err != nil {
-		return fmt.Errorf("begin cluster deletion request: %w", err)
+	if err := a.recordClusterDeletion(ctx, clusterID); err != nil {
+		return err
 	}
-	defer func() { _ = tx.Rollback(context.WithoutCancel(ctx)) }()
 
-	protected, err := txDB.LockClusterDeletionProtection(ctx, clusterID)
-	if dberrors.IsNotFoundError(err) {
+	return clusterassign.Settle(ctx, a.sqlcDB, clusterID)
+}
+
+// recordClusterDeletion has the cluster service record the deletion. It
+// refuses a protected cluster, and afterwards refuses turning protection on.
+// An absent cluster has nothing to record.
+func (a *APIStore) recordClusterDeletion(ctx context.Context, clusterID uuid.UUID) error {
+	_, err := a.clusterService.UpdateCluster(ctx, clustersgrpc.UpdateClusterRequest_builder{
+		ClusterId:       clusterID.String(),
+		RequestDeletion: true,
+	}.Build())
+	switch {
+	case status.Code(err) == codes.NotFound:
 		return nil
-	}
-	if err != nil {
-		return fmt.Errorf("lock cluster for deletion: %w", err)
-	}
-	if protected {
+	case clusterErrorReason(err) == clustersgrpc.ClusterErrorReason_CLUSTER_ERROR_REASON_DELETION_PROTECTED:
 		return errProtectedClusterDeletion
-	}
-	if err := txDB.RequestClusterDeletion(ctx, clusterID); err != nil {
+	case err != nil:
 		return fmt.Errorf("record cluster deletion: %w", err)
-	}
-	if err := tx.Commit(ctx); err != nil {
-		return fmt.Errorf("commit cluster deletion request: %w", err)
 	}
 
 	return nil
@@ -279,16 +263,20 @@ func (a *APIStore) ManagementClusterDestroyReadiness(c *gin.Context, clusterID a
 	ctx := c.Request.Context()
 	attrs := []attribute.KeyValue{telemetry.WithClusterID(clusterID)}
 
+	if !a.requireClusterService(c) {
+		return
+	}
+
 	// The cluster delete refuses a protected cluster, so refuse here too, before
 	// the caller detaches teams or destroys infrastructure.
-	protected, err := a.sqlcDB.ClusterDeletionProtected(ctx, clusterID)
+	cluster, err := a.lookUpCluster(ctx, &clusterID)
 	if err != nil {
 		telemetry.ReportCriticalError(ctx, "check cluster deletion protection failed", err, attrs...)
 		a.sendAPIStoreError(c, http.StatusInternalServerError, "Failed to check cluster destroy readiness")
 
 		return
 	}
-	if protected {
+	if cluster.GetDeletionProtection() {
 		a.sendAPIStoreError(c, http.StatusConflict, "Cluster has deletion protection turned on.")
 
 		return
@@ -302,7 +290,7 @@ func (a *APIStore) ManagementClusterDestroyReadiness(c *gin.Context, clusterID a
 		return
 	}
 	if shared {
-		a.sendAPIStoreError(c, http.StatusConflict, "Cluster is used by more than one team. Move the other teams and their templates off it before destroying the deployment.")
+		a.sendAPIStoreError(c, http.StatusConflict, "Cluster is used by more than one team and cannot be destroyed.")
 
 		return
 	}
@@ -310,102 +298,11 @@ func (a *APIStore) ManagementClusterDestroyReadiness(c *gin.Context, clusterID a
 	c.Status(http.StatusNoContent)
 }
 
-func (a *APIStore) ManagementAssignProjectCluster(c *gin.Context, projectID openapi_types.UUID, clusterID api.ClusterID) {
-	ctx := c.Request.Context()
-	attrs := []attribute.KeyValue{telemetry.WithTeamID(projectID.String()), telemetry.WithClusterID(clusterID)}
-
-	if clusterID == uuid.Nil {
-		apierrors.SendAPIError(c, &apierrors.APIError{Code: http.StatusBadRequest, ErrorCode: clusterAssignmentInvalidCode, ClientMsg: "cluster_id is required"})
-
-		return
-	}
-
-	result, err := a.sqlcDB.AssignTeamCluster(ctx, queries.AssignTeamClusterParams{
-		ClusterID:        clusterID,
-		TeamID:           projectID,
-		PreserveExisting: true,
-	})
-	switch {
-	case dberrors.IsNotFoundError(err):
-		apierrors.SendAPIError(c, &apierrors.APIError{Code: http.StatusNotFound, ErrorCode: clusterAssignmentProjectNotFoundCode, ClientMsg: "Team not found"})
-
-		return
-	case dberrors.IsForeignKeyViolation(err):
-		apierrors.SendAPIError(c, &apierrors.APIError{Code: http.StatusNotFound, ErrorCode: clusterAssignmentClusterNotFoundCode, ClientMsg: "Cluster not found"})
-
-		return
-	case dberrors.ConstraintName(err) == clusterDeletingConstraint:
-		apierrors.SendAPIError(c, &apierrors.APIError{Code: http.StatusConflict, ErrorCode: clusterAssignmentClusterDeletingCode, ClientMsg: "Cluster is being deleted"})
-
-		return
-	case err != nil:
-		telemetry.ReportCriticalError(ctx, "assign cluster to project failed", err, attrs...)
-		a.sendAPIStoreError(c, http.StatusInternalServerError, "Failed to assign cluster to team")
-
-		return
-	}
-	if !result.Assigned {
-		apierrors.SendAPIError(c, &apierrors.APIError{Code: http.StatusConflict, ErrorCode: clusterAssignmentAlreadyAssignedCode, ClientMsg: "Team is already assigned to a different cluster"})
-
-		return
-	}
-
-	// Sandbox placement reads the cluster from the cached team. A failed
-	// eviction is reported so the caller retries; the replay is idempotent.
-	if err := a.authService.InvalidateTeamCache(ctx, projectID); err != nil {
-		telemetry.ReportCriticalError(ctx, "invalidate team cache after cluster assignment failed", err, attrs...)
-		a.sendAPIStoreError(c, http.StatusInternalServerError, "Failed to invalidate team cache after cluster assignment")
-
-		return
-	}
-
-	c.Status(http.StatusNoContent)
-}
-
-func (a *APIStore) ManagementDetachProjectCluster(c *gin.Context, projectID openapi_types.UUID, clusterID api.ClusterID) {
-	ctx := c.Request.Context()
-	attrs := []attribute.KeyValue{telemetry.WithTeamID(projectID.String()), telemetry.WithClusterID(clusterID)}
-
-	result, err := a.sqlcDB.DetachTeamCluster(ctx, queries.DetachTeamClusterParams{
-		TeamID:    projectID,
-		ClusterID: clusterID,
-	})
-	if dberrors.IsNotFoundError(err) {
-		a.sendAPIStoreError(c, http.StatusNotFound, "Team not found")
-
-		return
-	}
-	if err != nil {
-		telemetry.ReportCriticalError(ctx, "detach cluster from project failed", err, attrs...)
-		a.sendAPIStoreError(c, http.StatusInternalServerError, "Failed to detach cluster from team")
-
-		return
-	}
-	if result.ClusterID != nil && !result.Detached {
-		a.sendAPIStoreError(c, http.StatusConflict, "Team is assigned to a different cluster")
-
-		return
-	}
-
-	if err := a.authService.InvalidateTeamCache(ctx, projectID); err != nil {
-		telemetry.ReportCriticalError(ctx, "invalidate team cache after cluster detachment failed", err, attrs...)
-		a.sendAPIStoreError(c, http.StatusInternalServerError, "Failed to invalidate team cache after cluster detachment")
-
-		return
-	}
-
-	c.Status(http.StatusNoContent)
-}
-
-func trimmedOptional(value *string) *string {
-	if value == nil {
+// optionalOf reads an optional proto field as a pointer.
+func optionalOf(present bool, value string) *string {
+	if !present {
 		return nil
 	}
 
-	trimmed := strings.TrimSpace(*value)
-	if trimmed == "" {
-		return nil
-	}
-
-	return &trimmed
+	return &value
 }

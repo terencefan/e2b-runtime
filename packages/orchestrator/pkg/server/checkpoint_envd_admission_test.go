@@ -47,7 +47,7 @@ func awaitCheckpointCrossedMarkStopping(t *testing.T, s *Server, sbx *sandbox.Sa
 		_, live := s.sandboxFactory.Sandboxes.Get(sbx.Runtime.SandboxID)
 
 		return !live
-	}, 2*time.Second, time.Millisecond, msg)
+	}, markStoppingWait, time.Millisecond, msg)
 	require.Eventually(t, func() bool {
 		return sbx.GetStopReason() == sandbox.StopReasonCheckpointing
 	}, 2*time.Second, time.Millisecond)
@@ -60,7 +60,7 @@ func awaitCheckpointCrossedMarkStopping(t *testing.T, s *Server, sbx *sandbox.Sa
 func TestCheckpoint_EnvdUnresponsiveRefusesBeforeAnyRoute(t *testing.T) {
 	t.Parallel()
 
-	s, reader := envdProbeCheckpointServer(t, new(envdProbeMs))
+	s, reader := envdProbeCheckpointServer(t, new(envdFailingProbeMs))
 	sbx := envdProbeSandbox(t, "sbx-envd-ckpt", 71)
 	registerEnvd(t, sbx, &envdAnswer{unreachable: true})
 	s.sandboxFactory.Sandboxes.MarkRunning(t.Context(), sbx)
@@ -80,6 +80,7 @@ func TestCheckpoint_EnvdUnresponsiveRefusesBeforeAnyRoute(t *testing.T) {
 	attrs := attrsAsMap(t, points[0].Attributes)
 	assert.Equal(t, string(sandbox.SnapshotAdmissionEnvdUnhealthy), attrs["outcome"])
 	assert.Equal(t, "checkpoint", attrs["rpc"])
+	assert.Equal(t, string(envdProbeUnanswered), attrs["cause"])
 	waits := admissionWaitPoints(t, reader)
 	require.Len(t, waits, 1)
 	assert.Equal(t, string(sandbox.SnapshotAdmissionEnvdUnhealthy), attrsAsMap(t, waits[0].Attributes)["outcome"])
@@ -96,7 +97,7 @@ func TestCheckpoint_EnvdUnresponsiveRefusesBeforeAnyRoute(t *testing.T) {
 func TestCheckpoint_EnvdHealthyAdmits(t *testing.T) {
 	t.Parallel()
 
-	s, reader := envdProbeCheckpointServer(t, new(envdProbeMs))
+	s, reader := envdProbeCheckpointServer(t, new(envdAnsweringProbeMs))
 	sbx := envdProbeSandbox(t, "sbx-envd-ckpt-healthy", 72)
 	registerEnvd(t, sbx, &envdAnswer{status: http.StatusNoContent})
 	s.sandboxFactory.Sandboxes.MarkRunning(t.Context(), sbx)
@@ -111,6 +112,7 @@ func TestCheckpoint_EnvdHealthyAdmits(t *testing.T) {
 	attrs := attrsAsMap(t, points[0].Attributes)
 	assert.Equal(t, string(sandbox.SnapshotAdmissionEnvdHealthy), attrs["outcome"])
 	assert.Equal(t, "checkpoint", attrs["rpc"])
+	assert.NotContains(t, attrs, "cause", "an admitted probe names no cause")
 }
 
 // A filesystem-only checkpoint is probed like a memory one: its capture asks
@@ -121,8 +123,8 @@ func TestCheckpoint_EnvdHealthyAdmits(t *testing.T) {
 func TestCheckpoint_FilesystemOnlyIsProbed(t *testing.T) {
 	t.Parallel()
 
-	s, reader := envdProbeCheckpointServer(t, new(envdProbeMs))
-	s.featureFlags = envdProbeFlagClientWith(t, new(envdProbeMs), true)
+	s, reader := envdProbeCheckpointServer(t, new(envdFailingProbeMs))
+	s.featureFlags = envdProbeFlagClientWith(t, new(envdFailingProbeMs), true)
 	sbx := envdProbeSandbox(t, "sbx-envd-ckpt-fs-only", 73)
 	registerEnvd(t, sbx, &envdAnswer{unreachable: true})
 	s.sandboxFactory.Sandboxes.MarkRunning(t.Context(), sbx)
@@ -138,6 +140,7 @@ func TestCheckpoint_FilesystemOnlyIsProbed(t *testing.T) {
 	attrs := attrsAsMap(t, points[0].Attributes)
 	assert.Equal(t, string(sandbox.SnapshotAdmissionEnvdUnhealthy), attrs["outcome"])
 	assert.Equal(t, "checkpoint", attrs["rpc"])
+	assert.Equal(t, string(envdProbeUnanswered), attrs["cause"])
 }
 
 // Flag absent, negative or zero means no probe: with envd unreachable the
@@ -171,7 +174,7 @@ func TestCheckpoint_EnvdProbeFlagOffRunsTodaysOrder(t *testing.T) {
 			awaitCheckpointCrossedMarkStopping(t, s, sbx, "flag off must reach MarkStopping without probing")
 			select {
 			case <-answer.begun:
-				t.Fatal("no probe runs with the flag off")
+				require.Fail(t, "no probe runs with the flag off")
 			default:
 			}
 			assert.Empty(t, admissionCounterPoints(t, reader), "no probe, no decision")
@@ -186,7 +189,7 @@ func TestCheckpoint_EnvdProbeFlagOffRunsTodaysOrder(t *testing.T) {
 func TestCheckpoint_EnvdProbeMissDuringAnInPlaceCheckpointAnswersInProgress(t *testing.T) {
 	t.Parallel()
 
-	s, reader := envdProbeCheckpointServer(t, new(envdProbeMs))
+	s, reader := envdProbeCheckpointServer(t, new(envdFailingProbeMs))
 	sbx := envdProbeSandbox(t, "sbx-envd-ckpt-inplace", 83)
 	registerEnvd(t, sbx, &envdAnswer{unreachable: true})
 	s.sandboxFactory.Sandboxes.MarkRunning(t.Context(), sbx)
@@ -201,7 +204,11 @@ func TestCheckpoint_EnvdProbeMissDuringAnInPlaceCheckpointAnswersInProgress(t *t
 
 	_, live := s.sandboxFactory.Sandboxes.Get("sbx-envd-ckpt-inplace")
 	assert.True(t, live, "the sandbox is untouched")
-	require.Len(t, admissionCounterPoints(t, reader), 1, "the probe decision is still counted")
+	points := admissionCounterPoints(t, reader)
+	require.Len(t, points, 1, "the probe decision is still counted")
+	attrs := attrsAsMap(t, points[0].Attributes)
+	assert.Equal(t, string(sandbox.SnapshotAdmissionEnvdUnhealthy), attrs["outcome"])
+	assert.Equal(t, string(envdProbeCheckpointInFlight), attrs["cause"])
 }
 
 // The probe runs after the start gate, so its answer is current when the
@@ -210,7 +217,7 @@ func TestCheckpoint_EnvdProbeMissDuringAnInPlaceCheckpointAnswersInProgress(t *t
 func TestCheckpoint_EnvdProbeRunsAfterTheStartGate(t *testing.T) {
 	t.Parallel()
 
-	s, reader := envdProbeCheckpointServer(t, new(envdProbeMs))
+	s, reader := envdProbeCheckpointServer(t, new(envdFailingProbeMs))
 	sbx := envdProbeSandbox(t, "sbx-envd-ckpt-gate", 77)
 	registerEnvd(t, sbx, &envdAnswer{unreachable: true})
 	s.sandboxFactory.Sandboxes.MarkRunning(t.Context(), sbx)
@@ -236,7 +243,7 @@ func TestCheckpoint_EnvdProbeRunsAfterTheStartGate(t *testing.T) {
 func TestCheckpoint_FilesystemOnlyDisabledIsRefusedBeforeTheProbe(t *testing.T) {
 	t.Parallel()
 
-	s, reader := envdProbeCheckpointServer(t, new(envdProbeMs))
+	s, reader := envdProbeCheckpointServer(t, new(envdFailingProbeMs))
 	sbx := envdProbeSandbox(t, "sbx-envd-ckpt-fs-only-off", 81)
 	answer := &envdAnswer{unreachable: true, begun: make(chan struct{})}
 	registerEnvd(t, sbx, answer)
@@ -248,7 +255,7 @@ func TestCheckpoint_FilesystemOnlyDisabledIsRefusedBeforeTheProbe(t *testing.T) 
 	assert.Nil(t, envdUnresponsiveDetail(t, ckptErr))
 	select {
 	case <-answer.begun:
-		t.Fatal("the guest must not be probed for a checkpoint the flag refuses")
+		require.Fail(t, "the guest must not be probed for a checkpoint the flag refuses")
 	default:
 	}
 	assert.Empty(t, admissionCounterPoints(t, reader), "no decision is recorded")

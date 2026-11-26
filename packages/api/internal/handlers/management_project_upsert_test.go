@@ -2,6 +2,7 @@ package handlers
 
 import (
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -16,11 +17,10 @@ import (
 	"go.opentelemetry.io/otel/metric/noop"
 
 	"github.com/e2b-dev/infra/packages/api/internal/api"
+	dbmodule "github.com/e2b-dev/infra/packages/api/internal/db"
+	"github.com/e2b-dev/infra/packages/api/internal/db/pkg/testutils"
 	"github.com/e2b-dev/infra/packages/api/internal/management"
 	"github.com/e2b-dev/infra/packages/api/internal/middleware"
-	dbmodule "github.com/e2b-dev/infra/packages/db"
-	"github.com/e2b-dev/infra/packages/db/pkg/testutils"
-	"github.com/e2b-dev/infra/packages/db/queries"
 )
 
 // The caller cannot tell a create from a reconcile, so one request serves both
@@ -29,12 +29,11 @@ func TestUpsertProjectCreatesThenReconciles(t *testing.T) {
 	t.Parallel()
 
 	db := testutils.SetupDatabase(t)
-	store, auth := newManagementStore(t, db)
+	store, _ := newManagementStore(t, db)
 	project := newProjectFixture()
 
 	created := callUpsertProject(t, store, project.id, project.request())
 	require.Equal(t, http.StatusCreated, created.Code, created.Body.String())
-	require.Empty(t, *auth.invalidatedTeamIDs, "a project that did not exist has nothing cached")
 
 	renamed := project.request()
 	renamed.Name = "Acme Renamed"
@@ -43,8 +42,28 @@ func TestUpsertProjectCreatesThenReconciles(t *testing.T) {
 	require.Equal(t, http.StatusOK, reconciled.Code, reconciled.Body.String())
 
 	require.Equal(t, "Acme Renamed", teamColumn(t, db, project.id, "name"))
-	// The team changed, so every cached copy of it is stale.
-	require.Equal(t, []uuid.UUID{project.id}, *auth.invalidatedTeamIDs)
+}
+
+func TestUnversionedProjectRequiresCacheEvictionBeforeAcknowledgement(t *testing.T) {
+	t.Parallel()
+
+	db := testutils.SetupDatabase(t)
+	store, cache := newManagementStore(t, db)
+	project := newProjectFixture()
+	cluster := createCluster(t, db)
+	request := project.request()
+	request.ClusterId = &cluster
+
+	cache.invalidateTeamErr = errors.New("cache unavailable")
+	require.Equal(t, http.StatusInternalServerError, callUpsertProject(t, store, project.id, request).Code)
+	require.Equal(t, &cluster, teamCluster(t, db, project.id))
+	require.Equal(t, http.StatusInternalServerError, callUpsertProject(t, store, project.id, request).Code)
+	cache.invalidateTeamErr = nil
+	res := callUpsertProject(t, store, project.id, request)
+	require.Equal(t, http.StatusOK, res.Code, res.Body.String())
+	var stored api.ManagementProject
+	require.NoError(t, json.Unmarshal(res.Body.Bytes(), &stored))
+	require.Equal(t, &cluster, stored.ClusterId)
 }
 
 // A retry after a response the caller never saw has to land on the same state.
@@ -209,12 +228,15 @@ func newManagementStore(t *testing.T, db *testutils.Database) (*APIStore, *fakeA
 	riverClient, err := river.NewClient(riverpgxv5.New(db.SqlcClient.Pool()), &river.Config{Schema: dbmodule.RiverSchema})
 	require.NoError(t, err)
 
+	clusterService := clusterServiceFor(t, db)
+
 	return &APIStore{
 		sqlcDB:            db.SqlcClient,
 		authDB:            db.AuthDB,
 		authService:       auth,
 		riverClient:       riverClient,
-		managementService: management.NewService(db.AuthDB, db.SqlcClient, auth, noop.NewMeterProvider()),
+		managementService: management.NewService(db.AuthDB, db.SqlcClient, auth, clusterService, noop.NewMeterProvider()),
+		clusterService:    clusterService,
 	}, auth
 }
 
@@ -285,8 +307,7 @@ func TestUpsertProjectRefusesAClusterBeingDeleted(t *testing.T) {
 	db := testutils.SetupDatabase(t)
 	store, _ := newManagementStore(t, db)
 	clusterID := createCluster(t, db)
-	require.NoError(t, db.SqlcClient.TestsRawSQL(t.Context(),
-		"UPDATE public.clusters SET deletion_requested_at = now() WHERE id = $1", clusterID))
+	markClusterDeleting(t, db, clusterID)
 	project := newProjectFixture()
 	request := project.request()
 	request.ClusterId = &clusterID
@@ -300,10 +321,8 @@ func TestUpsertProjectRefusesAClusterBeingDeleted(t *testing.T) {
 func createCluster(t *testing.T, db *testutils.Database) uuid.UUID {
 	t.Helper()
 
-	clusterID, err := db.SqlcClient.CreateCluster(t.Context(), queries.CreateClusterParams{
-		Name: "project-cluster-" + uuid.NewString()[:8], Endpoint: "https://cluster.example.test", Token: "test-token",
-	})
-	require.NoError(t, err)
+	clusterID := uuid.New()
+	insertCluster(t, db, clusterID, false)
 
 	return clusterID
 }

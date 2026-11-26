@@ -5,15 +5,19 @@
 # variable. Without it Compose renders a blank image name or a blank kernel
 # version and only warns, and the operator meets either a confusing "neither
 # an image nor a build context" error or a fetch-artifacts failure after the
-# host has already been mutated. The nine knobs that are genuinely optional and
-# are absent from .env (TEAM_API_KEY, ADMIN_TOKEN, SANDBOX_ACCESS_TOKEN_HASH_SEED,
-# E2B_DASHBOARD_HOST and E2B_OTEL_COLLECTOR_GRPC_ENDPOINT only as commented
-# lines) keep the ${VAR:-...} form: HUGEPAGES, NBDS_MAX, PF_MIN_FREE_GIB,
-# FORCE_REBUILD, E2B_DASHBOARD_HOST and E2B_OTEL_COLLECTOR_GRPC_ENDPOINT carry a
-# working default (the last an empty one, which exports no telemetry), while
-# TEAM_API_KEY, ADMIN_TOKEN and SANDBOX_ACCESS_TOKEN_HASH_SEED carry none — the
-# stack generates all three per install (seed for the key, api-secrets for the
-# api's two), and a value set in .env or the shell overrides the generated one.
+# host has already been mutated. The twelve knobs that are genuinely optional
+# and are absent from .env (TEAM_API_KEY, ADMIN_TOKEN,
+# SANDBOX_ACCESS_TOKEN_HASH_SEED, E2B_DASHBOARD_HOST,
+# E2B_OTEL_COLLECTOR_GRPC_ENDPOINT, MAX_SANDBOXES_PER_NODE,
+# MAX_STARTING_INSTANCES_PER_NODE and NETWORK_REUSED_SLOTS_POOL_SIZE only as
+# commented lines) keep the ${VAR:-...} form: HUGEPAGES, NBDS_MAX,
+# PF_MIN_FREE_GIB, FORCE_REBUILD, E2B_DASHBOARD_HOST,
+# E2B_OTEL_COLLECTOR_GRPC_ENDPOINT and the three node limits carry a working
+# default (the endpoint an empty one, which exports no telemetry, and the
+# limits one that keeps the orchestrator's own), while TEAM_API_KEY,
+# ADMIN_TOKEN and SANDBOX_ACCESS_TOKEN_HASH_SEED carry none — the stack
+# generates all three per install (seed for the key, api-secrets for the api's
+# two), and a value set in .env or the shell overrides the generated one.
 name: e2b
 
 x-tools: &tools
@@ -57,7 +61,7 @@ services:
 
   redis:
     logging: *logging
-    image: redis:7.4.6
+    image: redis:7.4.11
     restart: unless-stopped
     ports:
       - "127.0.0.1:6379:6379"
@@ -82,10 +86,17 @@ services:
       CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT: "1"
       # sha256 of config/clickhouse/config.xml, same purpose as
       # VECTOR_CONFIG_SHA256 on the vector service.
-      CLICKHOUSE_CONFIG_SHA256: 48f50a1778bd986fdfb74c3f1e796816dbaa78d56c26443b604cbba205504f83
+      CLICKHOUSE_CONFIG_SHA256: ff37f2b3dae5173a2488f755656442ed110f95c1e8a7bdbcfbeb8e6928caa2e7
     ports:
       - "127.0.0.1:9000:9000"
       - "127.0.0.1:8123:8123"
+    # ClickHouse opens every /sys/block entry at start; with NBDS_MAX at its
+    # ceiling that is more than the 1024 soft limit Docker 25+ leaves a
+    # container with.
+    ulimits:
+      nofile:
+        soft: 1048576
+        hard: 1048576
     volumes:
       - clickhouse:/var/lib/clickhouse
     configs:
@@ -99,7 +110,7 @@ services:
 
   vector:
     logging: *logging
-    image: timberio/vector:0.51.1-alpine
+    image: timberio/vector:0.62.0-alpine
     restart: unless-stopped
     depends_on:
       clickhouse:
@@ -111,7 +122,7 @@ services:
       # service hash change with the inline config so `up` recreates the
       # container (compose does not hash `configs:` content). Kept in step by
       # tests/config-hashes.bats.
-      VECTOR_CONFIG_SHA256: a4ca48367c4ae06f81fa08d9f8cbcace70f25a631f00496a44d96282e469b7a3
+      VECTOR_CONFIG_SHA256: 9ddca77ae94b51a7555164d39a00af9e5fdfe4b31d274746764235905e8abde8
     ports:
       - "127.0.0.1:30006:30006"
     configs:
@@ -318,6 +329,17 @@ services:
       # orchestrator's create-hugepage-admission flag, which has no
       # LaunchDarkly to come from here.
       CREATE_HUGEPAGE_ADMISSION: "true"
+      # How many sandboxes the node runs or starts (200), how many start at
+      # once (3), and how many network slots returned by ended sandboxes the
+      # pool keeps for the next ones (100). Empty keeps each default, as does
+      # the 0 the pool size falls back to. A slot returned to a full pool is
+      # torn down and new ones are made one at a time, so the pool follows the
+      # sandbox limit unless .env sets it. The first two are the orchestrator's
+      # max-sandboxes-per-node and max-starting-instances-per-node flags, which
+      # have no LaunchDarkly to come from here.
+      MAX_SANDBOXES_PER_NODE: ${MAX_SANDBOXES_PER_NODE:-}
+      MAX_STARTING_INSTANCES_PER_NODE: ${MAX_STARTING_INSTANCES_PER_NODE:-}
+      NETWORK_REUSED_SLOTS_POOL_SIZE: ${NETWORK_REUSED_SLOTS_POOL_SIZE:-${MAX_SANDBOXES_PER_NODE:-0}}
       BUILD_CACHE_STORAGE_URL: file:///var/lib/e2b/storage/build-cache
       ARTIFACTS_REGISTRY_PROVIDER: Local
       LOCAL_UPLOAD_BASE_URL: http://127.0.0.1:5008
@@ -331,6 +353,10 @@ services:
       # Warm-device buffer, kept below NBDS_MAX: at parity the refill loop spins and warns.
       NBD_POOL_SIZE: "32"
       NETWORK_VERSION: "1"
+      # Inert for the orchestrator. fetch-artifacts replaces the binary on disk
+      # and Compose restarts no service for that, so the pinned version is part
+      # of this service: a new pin makes `up` restart it on the new binary.
+      E2B_ORCHESTRATOR_VERSION: ${E2B_ORCHESTRATOR_VERSION:?fetch the .env that ships beside compose.yaml (README, Install)}
       DEFAULT_KERNEL_VERSION: ${E2B_KERNEL_VERSION:?fetch the .env that ships beside compose.yaml (README, Install)}
       DEFAULT_FIRECRACKER_VERSION: ${E2B_FIRECRACKER_VERSION:?fetch the .env that ships beside compose.yaml (README, Install)}
     depends_on:
@@ -686,6 +712,11 @@ configs:
           <listen_host>0.0.0.0</listen_host>
 
           <tcp_port>9000</tcp_port>
+
+          <!-- The stock config sends crash reports to ClickHouse's developers. -->
+          <send_crash_reports>
+              <enabled>false</enabled>
+          </send_crash_reports>
       </clickhouse>
   vector-config:
     content: |
@@ -698,7 +729,8 @@ configs:
       [sources.http_server]
       type = "http_server"
       address = "0.0.0.0:30006"
-      encoding = "ndjson"
+      decoding.codec = "json"
+      framing.method = "newline_delimited"
       path_key = "_path"
 
       [transforms.add_source_http_server]

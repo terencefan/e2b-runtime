@@ -19,8 +19,10 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/launchdarkly/go-sdk-common/v3/ldlog"
+	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"go.opentelemetry.io/otel/metric/noop"
+	"go.uber.org/zap/zaptest"
 
 	"github.com/e2b-dev/infra/packages/clickhouse/pkg/hoststats"
 	"github.com/e2b-dev/infra/packages/orchestrator/pkg/cfg"
@@ -52,8 +54,8 @@ import (
 )
 
 const (
-	baseImage = "ubuntu:22.04"
-	proxyPort = 5009
+	proxyPort         = 5009
+	smokeBuildTimeout = 5 * time.Minute
 )
 
 // TestSmokeAllFCVersions builds a template and resumes from it for every
@@ -78,6 +80,7 @@ func TestSmokeAllFCVersions(t *testing.T) { //nolint:paralleltest // subtests sh
 	ctx, cancel := context.WithTimeout(t.Context(), 30*time.Minute)
 	defer cancel()
 
+	baseImage := prepareSmokeImage(t, ctx)
 	infra := newTestInfra(t, ctx)
 	defer infra.close(ctx)
 
@@ -88,8 +91,10 @@ func TestSmokeAllFCVersions(t *testing.T) { //nolint:paralleltest // subtests sh
 			// Phase 1: create build
 			t.Logf("creating build %s with FC %s", buildID, fcVersion)
 			force := true
+			buildCtx, cancelBuild := context.WithTimeout(ctx, smokeBuildTimeout)
+			defer cancelBuild()
 			_, err := infra.builder.Build(
-				ctx,
+				buildCtx,
 				storage.Paths{BuildID: buildID},
 				config.TemplateConfig{
 					Version:            templates.TemplateV2LatestVersion,
@@ -104,7 +109,7 @@ func TestSmokeAllFCVersions(t *testing.T) { //nolint:paralleltest // subtests sh
 					FirecrackerVersion: fcVersion,
 					FromImage:          baseImage,
 				},
-				logger.NewNopLogger().Detach(ctx).Core(),
+				zaptest.NewLogger(t).Core(),
 			)
 			require.NoError(t, err, "create build failed for FC %s", fcVersion)
 			t.Logf("build %s done", buildID)
@@ -583,21 +588,20 @@ func assertFsFreezeQuiescesRootfsAt(t *testing.T, ctx context.Context, envdURL, 
 			cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), envdRequestTimeout)
 			defer cancel()
 
-			if _, err := postEnvd(cleanupCtx, client, envdURL, accessToken, "/fsthaw"); err != nil {
-				t.Errorf("thawing the guest rootfs during cleanup failed: %v", err)
-			}
+			_, err := postEnvd(cleanupCtx, client, envdURL, accessToken, "/fsthaw")
+			assert.NoError(t, err, "thawing the guest rootfs during cleanup") //nolint:testifylint // keep waiting for the blocked write below even if the thaw failed
 		}
 
 		select {
 		case <-blocked:
 		case <-time.After(thawedWriteTimeout):
-			t.Error("the write blocked by the freeze never completed after the thaw")
+			assert.Fail(t, "the write blocked by the freeze never completed after the thaw")
 		}
 	}()
 
 	select {
 	case blockedStatus := <-blocked:
-		t.Fatalf("a write to the frozen rootfs completed with HTTP %d; the freeze did not take", blockedStatus)
+		require.Failf(t, "a write to the frozen rootfs completed; the freeze did not take", "HTTP %d", blockedStatus)
 	case <-time.After(frozenWriteWindow):
 	}
 
@@ -626,7 +630,7 @@ func assertFsFreezeQuiescesRootfsAt(t *testing.T, ctx context.Context, envdURL, 
 	case blockedStatus := <-blocked:
 		require.Equal(t, http.StatusOK, blockedStatus, "the write blocked by the freeze should succeed once thawed")
 	case <-time.After(thawedWriteTimeout):
-		t.Fatal("the write blocked by the freeze did not complete after the thaw")
+		require.Fail(t, "the write blocked by the freeze did not complete after the thaw")
 	}
 }
 

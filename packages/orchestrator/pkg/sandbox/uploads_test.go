@@ -114,7 +114,7 @@ func putHeader(t *testing.T, cache *fakeCache, buildID uuid.UUID, fileType build
 	case build.Memfile:
 		tpl.EXPECT().Memfile(mock.Anything).Return(dev, nil).Maybe()
 	case build.Rootfs:
-		tpl.EXPECT().Rootfs().Return(dev, nil).Maybe()
+		tpl.EXPECT().Rootfs(mock.Anything).Return(dev, nil).Maybe()
 	}
 
 	cache.put(buildID.String(), tpl)
@@ -142,7 +142,7 @@ func TestUploads_BeginDistinctIDsAreIndependent(t *testing.T) {
 
 	select {
 	case <-futB.Done():
-		t.Fatal("futB should not be done after only futA fires")
+		require.Fail(t, "futB should not be done after only futA fires")
 	default:
 	}
 }
@@ -166,7 +166,7 @@ func TestUploads_Wait_BlocksUntilSet(t *testing.T) {
 
 	select {
 	case <-done:
-		t.Fatal("Wait should block until the future fires")
+		require.Fail(t, "Wait should block until the future fires")
 	case <-time.After(50 * time.Millisecond):
 	}
 
@@ -175,7 +175,7 @@ func TestUploads_Wait_BlocksUntilSet(t *testing.T) {
 	select {
 	case <-done:
 	case <-time.After(time.Second):
-		t.Fatal("Wait should return after future fires")
+		require.Fail(t, "Wait should return after future fires")
 	}
 }
 
@@ -217,7 +217,7 @@ func TestUploads_Wait_ContextCancellation(t *testing.T) {
 	case err := <-errCh:
 		require.ErrorIs(t, err, context.Canceled)
 	case <-time.After(time.Second):
-		t.Fatal("Wait should return on context cancel")
+		require.Fail(t, "Wait should return on context cancel")
 	}
 }
 
@@ -234,7 +234,7 @@ func TestUploads_Wait_NoFuture_ReadsFromCache(t *testing.T) {
 	tpl := templatemocks.NewMockTemplate(t)
 	dev := blockmocks.NewMockReadonlyDevice(t)
 	dev.EXPECT().Header().Return(want)
-	tpl.EXPECT().Rootfs().Return(dev, nil)
+	tpl.EXPECT().Rootfs(mock.Anything).Return(dev, nil)
 	cache.put(id.String(), tpl)
 
 	got, _, err := c.Wait(t.Context(), id, build.Rootfs)

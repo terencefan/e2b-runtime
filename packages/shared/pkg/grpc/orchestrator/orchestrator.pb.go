@@ -114,7 +114,11 @@ type SandboxConfig struct {
 	RamMb       int64             `protobuf:"varint,12,opt,name=ram_mb,json=ramMb,proto3" json:"ram_mb,omitempty"`
 	// VM capacity on cold boot; 0 defaults to max(vcpu, recorded snapshot capacity).
 	// Memory resumes use recorded capacity; legacy resizes must pass the original size.
-	MaxVcpus int64  `protobuf:"varint,28,opt,name=max_vcpus,json=maxVcpus,proto3" json:"max_vcpus,omitempty"`
+	MaxVcpus int64 `protobuf:"varint,28,opt,name=max_vcpus,json=maxVcpus,proto3" json:"max_vcpus,omitempty"`
+	// Memory the sandbox runs with, in MiB: ram_mb is boot RAM and the rest is plugged
+	// into the template's hotplug region. 0 keeps the size the sandbox was paused with
+	// (boot RAM for a template). A memory resume never shrinks a sandbox.
+	MemoryMb int64  `protobuf:"varint,29,opt,name=memory_mb,json=memoryMb,proto3" json:"memory_mb,omitempty"`
 	TeamId   string `protobuf:"bytes,13,opt,name=team_id,json=teamId,proto3" json:"team_id,omitempty"`
 	// Maximum length of the sandbox in Hours.
 	MaxSandboxLength int64   `protobuf:"varint,14,opt,name=max_sandbox_length,json=maxSandboxLength,proto3" json:"max_sandbox_length,omitempty"`
@@ -266,6 +270,13 @@ func (x *SandboxConfig) GetRamMb() int64 {
 func (x *SandboxConfig) GetMaxVcpus() int64 {
 	if x != nil {
 		return x.MaxVcpus
+	}
+	return 0
+}
+
+func (x *SandboxConfig) GetMemoryMb() int64 {
+	if x != nil {
+		return x.MemoryMb
 	}
 	return 0
 }
@@ -1823,7 +1834,6 @@ type RunningSandbox struct {
 	Config    *SandboxConfig         `protobuf:"bytes,1,opt,name=config,proto3" json:"config,omitempty"`
 	ClientId  string                 `protobuf:"bytes,2,opt,name=client_id,json=clientId,proto3" json:"client_id,omitempty"`
 	StartTime *timestamppb.Timestamp `protobuf:"bytes,3,opt,name=start_time,json=startTime,proto3" json:"start_time,omitempty"`
-	EndTime   *timestamppb.Timestamp `protobuf:"bytes,4,opt,name=end_time,json=endTime,proto3" json:"end_time,omitempty"`
 	// Minimal set required to detect an orphaned sandbox and kill it.
 	// sandbox_id + team_id form the store key. execution_id is carried in the
 	// edge sandbox-catalog delete event, so a cluster node's routing entry is
@@ -1842,7 +1852,12 @@ type RunningSandbox struct {
 	// The node keeps the ended sandbox, disk included, until the API ends it
 	// with its own timeout action: a kill, or a pause, which the node makes
 	// filesystem-only. Set for a guest that powered itself off.
-	DiskKept      bool `protobuf:"varint,12,opt,name=disk_kept,json=diskKept,proto3" json:"disk_kept,omitempty"`
+	DiskKept bool `protobuf:"varint,12,opt,name=disk_kept,json=diskKept,proto3" json:"disk_kept,omitempty"`
+	// Memory the sandbox runs with, in MiB: ram_mb of boot RAM plus the memory
+	// it asked its hotplug region to plug, including a size kept from its
+	// snapshot. ram_mb keeps meaning boot RAM; a node that predates this field
+	// leaves it unset, and ram_mb is then the whole size.
+	MemoryMb      *int64 `protobuf:"varint,13,opt,name=memory_mb,json=memoryMb,proto3,oneof" json:"memory_mb,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -1895,13 +1910,6 @@ func (x *RunningSandbox) GetClientId() string {
 func (x *RunningSandbox) GetStartTime() *timestamppb.Timestamp {
 	if x != nil {
 		return x.StartTime
-	}
-	return nil
-}
-
-func (x *RunningSandbox) GetEndTime() *timestamppb.Timestamp {
-	if x != nil {
-		return x.EndTime
 	}
 	return nil
 }
@@ -1962,6 +1970,13 @@ func (x *RunningSandbox) GetDiskKept() bool {
 	return false
 }
 
+func (x *RunningSandbox) GetMemoryMb() int64 {
+	if x != nil && x.MemoryMb != nil {
+		return *x.MemoryMb
+	}
+	return 0
+}
+
 type SandboxListResponse struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	Sandboxes     []*RunningSandbox      `protobuf:"bytes,1,rep,name=sandboxes,proto3" json:"sandboxes,omitempty"`
@@ -2010,7 +2025,7 @@ var File_orchestrator_proto protoreflect.FileDescriptor
 
 const file_orchestrator_proto_rawDesc = "" +
 	"\n" +
-	"\x12orchestrator.proto\x1a\x1bgoogle/protobuf/empty.proto\x1a\x1fgoogle/protobuf/timestamp.proto\"\xd2\n" +
+	"\x12orchestrator.proto\x1a\x1bgoogle/protobuf/empty.proto\x1a\x1fgoogle/protobuf/timestamp.proto\"\xef\n" +
 	"\n" +
 	"\rSandboxConfig\x12\x1f\n" +
 	"\vtemplate_id\x18\x01 \x01(\tR\n" +
@@ -2029,7 +2044,8 @@ const file_orchestrator_proto_rawDesc = "" +
 	" \x01(\tR\venvdVersion\x12\x12\n" +
 	"\x04vcpu\x18\v \x01(\x03R\x04vcpu\x12\x15\n" +
 	"\x06ram_mb\x18\f \x01(\x03R\x05ramMb\x12\x1b\n" +
-	"\tmax_vcpus\x18\x1c \x01(\x03R\bmaxVcpus\x12\x17\n" +
+	"\tmax_vcpus\x18\x1c \x01(\x03R\bmaxVcpus\x12\x1b\n" +
+	"\tmemory_mb\x18\x1d \x01(\x03R\bmemoryMb\x12\x17\n" +
 	"\ateam_id\x18\r \x01(\tR\x06teamId\x12,\n" +
 	"\x12max_sandbox_length\x18\x0e \x01(\x03R\x10maxSandboxLength\x12+\n" +
 	"\x12total_disk_size_mb\x18\x0f \x01(\x03R\x0ftotalDiskSizeMb\x12\x1a\n" +
@@ -2193,13 +2209,12 @@ const file_orchestrator_proto_rawDesc = "" +
 	"\x18SandboxCheckpointNetwork\x12;\n" +
 	"\tplacement\x18\x01 \x01(\v2\x18.SandboxNetworkPlacementH\x00R\tplacement\x88\x01\x01B\f\n" +
 	"\n" +
-	"_placement\"\xb2\x03\n" +
+	"_placement\"\xbb\x03\n" +
 	"\x0eRunningSandbox\x12*\n" +
 	"\x06config\x18\x01 \x01(\v2\x0e.SandboxConfigB\x02\x18\x01R\x06config\x12\x1b\n" +
 	"\tclient_id\x18\x02 \x01(\tR\bclientId\x129\n" +
 	"\n" +
-	"start_time\x18\x03 \x01(\v2\x1a.google.protobuf.TimestampR\tstartTime\x125\n" +
-	"\bend_time\x18\x04 \x01(\v2\x1a.google.protobuf.TimestampR\aendTime\x12\x1d\n" +
+	"start_time\x18\x03 \x01(\v2\x1a.google.protobuf.TimestampR\tstartTime\x12\x1d\n" +
 	"\n" +
 	"sandbox_id\x18\x05 \x01(\tR\tsandboxId\x12\x17\n" +
 	"\ateam_id\x18\x06 \x01(\tR\x06teamId\x12!\n" +
@@ -2210,7 +2225,10 @@ const file_orchestrator_proto_rawDesc = "" +
 	" \x01(\bR\x05ended\x12,\n" +
 	"\vguest_event\x18\v \x01(\x0e2\v.GuestEventR\n" +
 	"guestEvent\x12\x1b\n" +
-	"\tdisk_kept\x18\f \x01(\bR\bdiskKept\"D\n" +
+	"\tdisk_kept\x18\f \x01(\bR\bdiskKept\x12 \n" +
+	"\tmemory_mb\x18\r \x01(\x03H\x00R\bmemoryMb\x88\x01\x01B\f\n" +
+	"\n" +
+	"_memory_mbJ\x04\b\x04\x10\x05R\bend_time\"D\n" +
 	"\x13SandboxListResponse\x12-\n" +
 	"\tsandboxes\x18\x01 \x03(\v2\x0f.RunningSandboxR\tsandboxes*\xdd\x01\n" +
 	"\n" +
@@ -2310,28 +2328,27 @@ var file_orchestrator_proto_depIdxs = []int32{
 	15, // 25: SandboxCheckpointNetwork.placement:type_name -> SandboxNetworkPlacement
 	1,  // 26: RunningSandbox.config:type_name -> SandboxConfig
 	32, // 27: RunningSandbox.start_time:type_name -> google.protobuf.Timestamp
-	32, // 28: RunningSandbox.end_time:type_name -> google.protobuf.Timestamp
-	0,  // 29: RunningSandbox.guest_event:type_name -> GuestEvent
-	24, // 30: SandboxListResponse.sandboxes:type_name -> RunningSandbox
-	3,  // 31: SandboxIam.TokensEntry.value:type_name -> SandboxIamToken
-	9,  // 32: SandboxNetworkEgressConfig.RulesEntry.value:type_name -> SandboxNetworkDomainRules
-	13, // 33: SandboxService.Create:input_type -> SandboxCreateRequest
-	16, // 34: SandboxService.Update:input_type -> SandboxUpdateRequest
-	33, // 35: SandboxService.List:input_type -> google.protobuf.Empty
-	17, // 36: SandboxService.Delete:input_type -> SandboxDeleteRequest
-	18, // 37: SandboxService.Pause:input_type -> SandboxPauseRequest
-	21, // 38: SandboxService.Checkpoint:input_type -> SandboxCheckpointRequest
-	14, // 39: SandboxService.Create:output_type -> SandboxCreateResponse
-	33, // 40: SandboxService.Update:output_type -> google.protobuf.Empty
-	25, // 41: SandboxService.List:output_type -> SandboxListResponse
-	33, // 42: SandboxService.Delete:output_type -> google.protobuf.Empty
-	20, // 43: SandboxService.Pause:output_type -> SandboxPauseResponse
-	22, // 44: SandboxService.Checkpoint:output_type -> SandboxCheckpointResponse
-	39, // [39:45] is the sub-list for method output_type
-	33, // [33:39] is the sub-list for method input_type
-	33, // [33:33] is the sub-list for extension type_name
-	33, // [33:33] is the sub-list for extension extendee
-	0,  // [0:33] is the sub-list for field type_name
+	0,  // 28: RunningSandbox.guest_event:type_name -> GuestEvent
+	24, // 29: SandboxListResponse.sandboxes:type_name -> RunningSandbox
+	3,  // 30: SandboxIam.TokensEntry.value:type_name -> SandboxIamToken
+	9,  // 31: SandboxNetworkEgressConfig.RulesEntry.value:type_name -> SandboxNetworkDomainRules
+	13, // 32: SandboxService.Create:input_type -> SandboxCreateRequest
+	16, // 33: SandboxService.Update:input_type -> SandboxUpdateRequest
+	33, // 34: SandboxService.List:input_type -> google.protobuf.Empty
+	17, // 35: SandboxService.Delete:input_type -> SandboxDeleteRequest
+	18, // 36: SandboxService.Pause:input_type -> SandboxPauseRequest
+	21, // 37: SandboxService.Checkpoint:input_type -> SandboxCheckpointRequest
+	14, // 38: SandboxService.Create:output_type -> SandboxCreateResponse
+	33, // 39: SandboxService.Update:output_type -> google.protobuf.Empty
+	25, // 40: SandboxService.List:output_type -> SandboxListResponse
+	33, // 41: SandboxService.Delete:output_type -> google.protobuf.Empty
+	20, // 42: SandboxService.Pause:output_type -> SandboxPauseResponse
+	22, // 43: SandboxService.Checkpoint:output_type -> SandboxCheckpointResponse
+	38, // [38:44] is the sub-list for method output_type
+	32, // [32:38] is the sub-list for method input_type
+	32, // [32:32] is the sub-list for extension type_name
+	32, // [32:32] is the sub-list for extension extendee
+	0,  // [0:32] is the sub-list for field type_name
 }
 
 func init() { file_orchestrator_proto_init() }
@@ -2350,6 +2367,7 @@ func file_orchestrator_proto_init() {
 	file_orchestrator_proto_msgTypes[16].OneofWrappers = []any{}
 	file_orchestrator_proto_msgTypes[21].OneofWrappers = []any{}
 	file_orchestrator_proto_msgTypes[22].OneofWrappers = []any{}
+	file_orchestrator_proto_msgTypes[23].OneofWrappers = []any{}
 	type x struct{}
 	out := protoimpl.TypeBuilder{
 		File: protoimpl.DescBuilder{

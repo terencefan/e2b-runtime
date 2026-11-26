@@ -135,7 +135,7 @@ func pauseFreezesAfterTheCut(t *testing.T, s *Sandbox, e *heldEnvd) {
 	select {
 	case <-s.envdReinit.Load().done:
 	default:
-		t.Fatal("the cut returned before the re-init did")
+		require.Fail(t, "the cut returned before the re-init did")
 	}
 	s.bestEffortReclaim(t.Context(), true)
 	assert.Contains(t, e.paths(), "/freeze", "the freeze is requested once the re-init has returned")
@@ -166,7 +166,7 @@ func TestReinitCut(t *testing.T) { //nolint:paralleltest // reads deltas of a co
 		assert.Zero(t, reinitFailureLogs(version), "a cut is no failure")
 		select {
 		case <-abandoned:
-			t.Fatal("the handler finished before the cut released it: the cut waited on envd")
+			require.Fail(t, "the handler finished before the cut released it: the cut waited on envd")
 		default:
 		}
 	})
@@ -285,7 +285,7 @@ func TestReinitCut(t *testing.T) { //nolint:paralleltest // reads deltas of a co
 		select {
 		case <-r.done:
 		case <-time.After(2 * time.Second):
-			t.Fatal("the replaced re-init kept its /init in flight")
+			require.Fail(t, "the replaced re-init kept its /init in flight")
 		}
 		// The fresh re-init's /init must have been read before the test's cleanup cancels
 		// it, or the double's read fails after the test is over.
@@ -364,7 +364,7 @@ func TestReinitCut(t *testing.T) { //nolint:paralleltest // reads deltas of a co
 			select {
 			case <-arrived:
 			default:
-				t.Fatal("the setup outran the budget: the re-init ended before its /init arrived")
+				require.Fail(t, "the setup outran the budget: the re-init ended before its /init arrived")
 			}
 		}
 		<-done
@@ -694,7 +694,7 @@ func TestStartEnvdReinitUnderAPauseCutPublishesNothing(t *testing.T) {
 			}
 			s, _, _ := newReinitSandbox(t, e.srv.URL, true, time.Minute)
 
-			require.True(t, s.startEnvdReinit(t.Context()))
+			require.NotNil(t, s.startEnvdReinit(t.Context()))
 			r := s.envdReinit.Load()
 			<-arrived
 
@@ -704,14 +704,14 @@ func TestStartEnvdReinitUnderAPauseCutPublishesNothing(t *testing.T) {
 			<-r.done
 
 			// The interleaving: a start between the cut and the freeze.
-			assert.False(t, s.startEnvdReinit(t.Context()), "a start under the cut publishes nothing")
+			assert.Nil(t, s.startEnvdReinit(t.Context()), "a start under the cut publishes nothing")
 			assert.Same(t, r, s.envdReinit.Load(), "the cut handle stays in place")
 			assert.Equal(t, 1, countInits(e), "nothing wrote an /init after the cut")
 
 			if tc.freezeLands {
 				pauseLanded = true
 				s.releaseEnvdReinit()
-				require.True(t, s.startEnvdReinit(t.Context()), "once the freeze landed, a start publishes")
+				require.NotNil(t, s.startEnvdReinit(t.Context()), "once the freeze landed, a start publishes")
 			} else {
 				require.NoError(t, cleanup.Run(t.Context()))
 			}
@@ -722,7 +722,7 @@ func TestStartEnvdReinitUnderAPauseCutPublishesNothing(t *testing.T) {
 			if tc.freezeLands {
 				require.NoError(t, cleanup.Run(t.Context()), "a landed Pause's cleanup releases nothing")
 			}
-			assert.True(t, s.startEnvdReinit(t.Context()), "no hold is left")
+			assert.NotNil(t, s.startEnvdReinit(t.Context()), "no hold is left")
 			<-s.envdReinit.Load().done
 		})
 	}
@@ -739,11 +739,11 @@ func TestStartEnvdReinitUnderAPauseCutPublishesNothing(t *testing.T) {
 			assert.Nil(t, r)
 			assert.False(t, cut)
 		}
-		assert.False(t, s.startEnvdReinit(t.Context()), "two Pauses hold")
+		assert.Nil(t, s.startEnvdReinit(t.Context()), "two Pauses hold")
 		s.releaseEnvdReinit()
-		assert.False(t, s.startEnvdReinit(t.Context()), "one Pause still holds")
+		assert.Nil(t, s.startEnvdReinit(t.Context()), "one Pause still holds")
 		s.releaseEnvdReinit()
-		require.True(t, s.startEnvdReinit(t.Context()), "no Pause holds")
+		require.NotNil(t, s.startEnvdReinit(t.Context()), "no Pause holds")
 		<-s.envdReinit.Load().done
 		assert.Equal(t, 1, countInits(e))
 	})

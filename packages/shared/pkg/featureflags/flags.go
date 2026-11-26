@@ -194,6 +194,12 @@ var (
 	OrchAcceptsCombinedHostFlag         = NewBoolFlag("orch-accepts-combined-host", false)
 	WorkspacesEnabledFlag               = NewBoolFlag("workspacesEnabled", false)
 
+	// NFSCacheIndexWritesFlag lets orchestrators record the builds they use
+	// from the NFS chunk cache in Redis, the last-use index the cache cleaner
+	// evicts from. Read at every flush, so turning it off stops writes within
+	// one flush interval.
+	NFSCacheIndexWritesFlag = NewBoolFlag("nfs-cache-index-writes", false)
+
 	// ClientProxyResumeParkingFlag lets client-proxy retry a wake-on-traffic
 	// resume that failed retryably, read by each request at its own park
 	// transition: off means the first retryable failure is that request's answer.
@@ -509,6 +515,19 @@ var (
 	// read, with the same store commands as before.
 	SandboxListMaxLagMsFlag = NewIntFlag("sandbox-list-max-lag-ms", 0)
 
+	// SandboxStateSchedulingAPIFlag sends the API's sandbox store calls to
+	// scheduling-api instead of its own Redis store. Evaluated per call with
+	// team and sandbox contexts, and only when the API has a scheduling-api
+	// address. The fallback reads SANDBOX_STATE_SCHEDULING_API.
+	SandboxStateSchedulingAPIFlag = NewBoolFlag("sandbox-state-scheduling-api", envBoolOr("SANDBOX_STATE_SCHEDULING_API", false))
+
+	// NodeInfoRefreshIntervalSecondsFlag is how often, in seconds, each API
+	// replica asks the local cluster's nodes for their status and metrics
+	// between syncs, so a node that stopped accepting sandboxes is seen that
+	// much sooner. A sync that runs until the next one is due leaves no time
+	// for a refresh. The fallback, zero, leaves the sync as the only refresh.
+	NodeInfoRefreshIntervalSecondsFlag = NewIntFlag("node-info-refresh-interval-seconds", 0)
+
 	// UnpaginatedTemplateListCapFlag caps GET /templates at 5000 templates; a
 	// team above it gets a 400 pointing at GET /v2/templates. Evaluated per team.
 	UnpaginatedTemplateListCapFlag = NewBoolFlag("unpaginated-template-list-cap", true)
@@ -700,6 +719,19 @@ var (
 	PlacementMemoryMaxOvercommit  = NewIntFlag("placement-memory-max-overcommit", 0)                 // Template RAM of a node's sandboxes as a percentage of its base hugepage pool (its total memory, for a sandbox without hugepages), past which placement refuses; 0 disables the check
 	EnvdInitTimeoutMilliseconds   = NewIntFlag("envd-init-request-timeout-milliseconds", 50)         // Timeout for envd init request in milliseconds
 	EnvdTimeoutMilliseconds       = NewIntFlag("envd-timeout-milliseconds", envdTimeoutFallbackMs()) // Timeout for waiting for envd on resume; falls back to ENVD_TIMEOUT env var (default 10s)
+	// MemoryResizeWaitMilliseconds bounds how long a start that changes a sandbox's plugged memory waits
+	// for Firecracker to report it plugged and for envd to report the new memory in use, before it
+	// returns anyway and confirmation goes on in the background. Starts that keep their size never wait.
+	// Default 1500: a 2 GiB plug and envd's limit took under 0.1 s on a dev guest, and a plug scales
+	// with its size, so this covers plugs of tens of GiB while capping what a slow guest adds to a start.
+	MemoryResizeWaitMilliseconds = NewIntFlag("memory-resize-wait-milliseconds", 1500)
+	// MemoryResizePollMilliseconds is how often, within that wait, a start that changes a sandbox's
+	// plugged memory asks Firecracker whether the plugged size has reached the requested one. The wait
+	// is the whole budget before confirmation moves to the background; this is the pace inside it, so
+	// a plug that lands between polls costs the start up to one interval. The orchestrator keeps it
+	// within 1-100 ms and reads 0 or less as the default. Default 5: dev-cluster plugs took 41-67 ms
+	// and at a 20 ms poll bunched at two or three polls. The background stage keeps its own backoff.
+	MemoryResizePollMilliseconds = NewIntFlag("memory-resize-poll-milliseconds", 5)
 	// SandboxMigrationOperationBudgetSeconds bounds how long a sandbox migration may run, fixed per migration at acceptance.
 	SandboxMigrationOperationBudgetSeconds = NewIntFlag("sandbox-migration-operation-budget-seconds", 900)
 	// SandboxMigrationTerminationBudgetSeconds is how long the API's hold on a migrating sandbox outlives the operation deadline, fixed per migration at acceptance.
@@ -996,6 +1028,67 @@ var (
 	// 1 or lower keeps the existing serial path.
 	MaxParallelBuildReadSegments = NewIntFlag("max-parallel-build-read-segments", 1)
 )
+
+// RootfsReadAheadFlag configures read-ahead for sandboxes reading their rootfs
+// cold and in order, as one JSON object:
+//
+//	{"chunks": 8, "streams": 16, "nodeMaxInflight": 32}
+//
+// chunks is how many chunks a sequential cold reader of a rootfs build file
+// keeps fetching ahead of itself. A reader counts as sequential once it misses
+// two chunks in a row, or misses a chunk inside or at the edge of what was read
+// ahead for it. 0 or negative turns read-ahead off; above 64 is treated as 64.
+//
+// streams is how many sequential readers of one rootfs build file are followed
+// at once, for example several sandboxes started from the same template. A cold
+// read that continues none of them takes over the slot used least recently, so
+// with more readers than slots they keep taking each other's slots and none
+// gets read-ahead. The file may have chunks fetches in flight per slot. Below 1
+// is treated as 1, above 32 as 32.
+//
+// nodeMaxInflight caps the read-ahead fetches running at once across all files
+// on the orchestrator. A chunk that finds the cap full is not fetched ahead
+// then; the reader's next cold read tries it again, or the reader fetches it on
+// demand. 0 or negative allows none.
+//
+// A missing or non-numeric field takes its default (chunks 0, streams 4,
+// nodeMaxInflight 32), so an unset or malformed value leaves read-ahead off.
+// Evaluated on every cold rootfs read, so a change applies without a restart.
+var RootfsReadAheadFlag = NewJSONFlag("rootfs-read-ahead", ldvalue.Null())
+
+// Defaults of RootfsReadAheadFlag's fields.
+const (
+	RootfsReadAheadDefaultChunks          = 0
+	RootfsReadAheadDefaultStreams         = 4
+	RootfsReadAheadDefaultNodeMaxInflight = 32
+)
+
+// RootfsReadAheadConfig is one evaluation of RootfsReadAheadFlag, before the
+// reader clamps it.
+type RootfsReadAheadConfig struct {
+	Chunks          int
+	Streams         int
+	NodeMaxInflight int
+}
+
+// GetRootfsReadAheadConfig evaluates RootfsReadAheadFlag.
+func GetRootfsReadAheadConfig(ctx context.Context, ff *Client, contexts ...ldcontext.Context) RootfsReadAheadConfig {
+	v := ff.JSONFlag(ctx, RootfsReadAheadFlag, contexts...)
+	num := func(key string, def int) int {
+		f := v.GetByKey(key)
+		if !f.IsNumber() {
+			return def
+		}
+
+		return f.IntValue()
+	}
+
+	return RootfsReadAheadConfig{
+		Chunks:          num("chunks", RootfsReadAheadDefaultChunks),
+		Streams:         num("streams", RootfsReadAheadDefaultStreams),
+		NodeMaxInflight: num("nodeMaxInflight", RootfsReadAheadDefaultNodeMaxInflight),
+	}
+}
 
 // ReclaimConfigFlag holds per-step caps in milliseconds for the pre-pause
 // reclaim chain. Missing/zero/negative values disable the step.

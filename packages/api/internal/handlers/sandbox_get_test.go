@@ -20,15 +20,28 @@ import (
 	snapshotcache "github.com/e2b-dev/infra/packages/api/internal/cache/snapshots"
 	"github.com/e2b-dev/infra/packages/api/internal/cfg"
 	"github.com/e2b-dev/infra/packages/api/internal/clusters"
+	dbtypes "github.com/e2b-dev/infra/packages/api/internal/db/pkg/types"
+	"github.com/e2b-dev/infra/packages/api/internal/db/queries"
 	"github.com/e2b-dev/infra/packages/api/internal/orchestrator"
+	"github.com/e2b-dev/infra/packages/api/internal/sandbox"
 	"github.com/e2b-dev/infra/packages/auth/pkg/auth"
 	authtypes "github.com/e2b-dev/infra/packages/auth/pkg/types"
-	dbtypes "github.com/e2b-dev/infra/packages/db/pkg/types"
-	"github.com/e2b-dev/infra/packages/db/queries"
 	"github.com/e2b-dev/infra/packages/shared/pkg/featureflags"
 	redis_utils "github.com/e2b-dev/infra/packages/shared/pkg/redis"
 	"github.com/e2b-dev/infra/packages/shared/pkg/telemetry"
 )
+
+const egressCredential = "Bearer third-party-credential"
+
+func injectsACredential() *dbtypes.PausedSandboxConfig {
+	return &dbtypes.PausedSandboxConfig{Network: &dbtypes.SandboxNetworkConfig{
+		Egress: &dbtypes.SandboxNetworkEgressConfig{Rules: map[string][]dbtypes.SandboxNetworkRule{
+			"api.example.com": {{Transform: &dbtypes.SandboxNetworkTransform{
+				Headers: map[string]string{"Authorization": egressCredential},
+			}}},
+		}},
+	}}
+}
 
 func TestGetSandboxesSandboxID_PausedMetadata(t *testing.T) {
 	t.Parallel()
@@ -43,21 +56,26 @@ func TestGetSandboxesSandboxID_PausedMetadata(t *testing.T) {
 	snapshots := snapshotcache.NewSnapshotCache(nil, redisClient)
 	orch, err := orchestrator.New(ctx, cfg.Config{}, &telemetry.Client{MeterProvider: noop.NewMeterProvider()},
 		nil, true, nil, redisClient, nil, clusters.NewTestPool(), flags, nil, snapshots, nil,
-		insecure.NewCredentials(), insecure.NewCredentials())
+		insecure.NewCredentials(), insecure.NewCredentials(), nil)
 	require.NoError(t, err)
 	t.Cleanup(func() {
 		require.NoError(t, orch.Close(context.WithoutCancel(t.Context())))
 		require.NoError(t, snapshots.Close(context.WithoutCancel(t.Context())))
 	})
-	store := &APIStore{orchestrator: orch, snapshotCache: snapshots}
+	tokens, err := sandbox.NewAccessTokenGenerator("seed")
+	require.NoError(t, err)
+	store := &APIStore{orchestrator: orch, snapshotCache: snapshots, accessTokenGenerator: tokens}
 	teamID := uuid.New()
 
 	for _, tt := range []struct {
-		name       string
-		sandboxID  string
-		config     *dbtypes.PausedSandboxConfig
-		aliases    []string
-		wantMounts string
+		name        string
+		sandboxID   string
+		config      *dbtypes.PausedSandboxConfig
+		aliases     []string
+		wantMounts  string
+		role        string
+		secure      bool
+		wantSecrets bool
 	}{
 		{
 			name:      "mounts without alias",
@@ -70,6 +88,8 @@ func TestGetSandboxesSandboxID_PausedMetadata(t *testing.T) {
 		},
 		{name: "empty mounts with aliases", sandboxID: "pausedaliases", config: &dbtypes.PausedSandboxConfig{}, aliases: []string{"first", "second"}, wantMounts: `[]`},
 		{name: "legacy snapshot without config", sandboxID: "pausedlegacy"},
+		{name: "secure sandbox read by a member", sandboxID: "pausedmember", config: injectsACredential(), wantMounts: `[]`, role: authtypes.TeamRoleMember, secure: true, wantSecrets: true},
+		{name: "secure sandbox read by a viewer", sandboxID: "pausedviewer", config: injectsACredential(), wantMounts: `[]`, role: authtypes.TeamRoleViewer, secure: true},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
@@ -77,12 +97,13 @@ func TestGetSandboxesSandboxID_PausedMetadata(t *testing.T) {
 			sandboxID := tt.sandboxID
 			diskSize := int64(1024)
 			envdVersion := "v1.0.0"
-			data, err := json.Marshal(snapshotcache.SnapshotInfo{
+			data, err := json.Marshal(snapshotcache.SnapshotInfo{ //nolint:musttag // Snapshot rows use their Go field names in the shared cache format.
 				Aliases: tt.aliases,
 				Snapshot: queries.Snapshot{
-					SandboxID: sandboxID, TeamID: teamID, BaseEnvID: "template", Config: tt.config,
+					SandboxID: sandboxID, TeamID: teamID, BaseEnvID: "template", Config: tt.config, EnvSecure: tt.secure,
 				},
 				EnvBuild: queries.EnvBuild{TotalDiskSizeMb: &diskSize, EnvdVersion: &envdVersion},
+				Format:   snapshotcache.SnapshotInfoFormat,
 			})
 			require.NoError(t, err)
 			// The snapshot cache's Redis key. A miss falls through to the nil DB and panics.
@@ -91,13 +112,20 @@ func TestGetSandboxesSandboxID_PausedMetadata(t *testing.T) {
 			recorder := httptest.NewRecorder()
 			ginCtx, _ := gin.CreateTestContext(recorder)
 			ginCtx.Request = httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/sandboxes/"+sandboxID, nil)
-			auth.SetTeamInfoForTest(t, ginCtx, &authtypes.Team{Team: &dbtypes.Team{ID: teamID}})
+			auth.SetTeamInfoForTest(t, ginCtx, &authtypes.Team{Team: &dbtypes.Team{ID: teamID}, Role: tt.role})
 			store.GetSandboxesSandboxID(ginCtx, sandboxID)
 
 			require.Equal(t, http.StatusOK, recorder.Code, recorder.Body.String())
 			var body map[string]json.RawMessage
 			require.NoError(t, json.Unmarshal(recorder.Body.Bytes(), &body))
 			assert.JSONEq(t, `"paused"`, string(body["state"]))
+			if tt.wantSecrets {
+				assert.Contains(t, body, "envdAccessToken")
+				assert.Contains(t, recorder.Body.String(), egressCredential)
+			} else {
+				assert.NotContains(t, body, "envdAccessToken")
+				assert.NotContains(t, recorder.Body.String(), egressCredential)
+			}
 			if tt.wantMounts == "" {
 				assert.NotContains(t, body, "volumeMounts")
 			} else {

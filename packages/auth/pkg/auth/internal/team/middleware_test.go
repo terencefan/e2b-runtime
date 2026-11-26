@@ -11,8 +11,8 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/e2b-dev/infra/packages/auth/pkg/auth/internal/authcontext"
+	"github.com/e2b-dev/infra/packages/auth/pkg/teamdata"
 	"github.com/e2b-dev/infra/packages/auth/pkg/types"
-	authqueries "github.com/e2b-dev/infra/packages/db/pkg/auth/queries"
 )
 
 func TestEnforceBlockedTeam(t *testing.T) {
@@ -45,7 +45,7 @@ func TestEnforceBlockedTeam(t *testing.T) {
 			name:           "not blocked passes",
 			method:         http.MethodPost,
 			fullPath:       "/sandboxes",
-			team:           types.NewTeam(authqueries.GetTeamByTeamIDRow{IsBlocked: false}),
+			team:           &types.Team{Team: &teamdata.Team{IsBlocked: false}},
 			wantHandlerRan: true,
 			wantStatus:     http.StatusOK,
 		},
@@ -53,7 +53,7 @@ func TestEnforceBlockedTeam(t *testing.T) {
 			name:           "blocked and allowlisted get passes",
 			method:         http.MethodGet,
 			fullPath:       "/sandboxes",
-			team:           types.NewTeam(authqueries.GetTeamByTeamIDRow{IsBlocked: true, BlockedReason: &reason}),
+			team:           &types.Team{Team: &teamdata.Team{IsBlocked: true, BlockedReason: &reason}},
 			wantHandlerRan: true,
 			wantStatus:     http.StatusOK,
 		},
@@ -61,7 +61,7 @@ func TestEnforceBlockedTeam(t *testing.T) {
 			name:           "blocked and allowlisted delete passes",
 			method:         http.MethodDelete,
 			fullPath:       "/sandboxes/:sandboxID",
-			team:           types.NewTeam(authqueries.GetTeamByTeamIDRow{IsBlocked: true, BlockedReason: &reason}),
+			team:           &types.Team{Team: &teamdata.Team{IsBlocked: true, BlockedReason: &reason}},
 			wantHandlerRan: true,
 			wantStatus:     http.StatusOK,
 		},
@@ -69,7 +69,7 @@ func TestEnforceBlockedTeam(t *testing.T) {
 			name:           "blocked and non-allowlisted post denied",
 			method:         http.MethodPost,
 			fullPath:       "/sandboxes",
-			team:           types.NewTeam(authqueries.GetTeamByTeamIDRow{IsBlocked: true, BlockedReason: &reason}),
+			team:           &types.Team{Team: &teamdata.Team{IsBlocked: true, BlockedReason: &reason}},
 			wantHandlerRan: false,
 			wantStatus:     http.StatusForbidden,
 			wantBodyHas:    "team is blocked: " + reason,
@@ -78,7 +78,7 @@ func TestEnforceBlockedTeam(t *testing.T) {
 			name:           "blocked and method mismatch on allowlisted path denied",
 			method:         http.MethodPost,
 			fullPath:       "/sandboxes/:sandboxID",
-			team:           types.NewTeam(authqueries.GetTeamByTeamIDRow{IsBlocked: true}),
+			team:           &types.Team{Team: &teamdata.Team{IsBlocked: true}},
 			wantHandlerRan: false,
 			wantStatus:     http.StatusForbidden,
 			wantBodyHas:    "team is blocked",
@@ -103,7 +103,7 @@ func TestEnforceBlockedTeam(t *testing.T) {
 func TestEnforceBlockedTeam_AllowlistParameterization(t *testing.T) {
 	t.Parallel()
 
-	team := types.NewTeam(authqueries.GetTeamByTeamIDRow{IsBlocked: true})
+	team := &types.Team{Team: &teamdata.Team{IsBlocked: true}}
 	const method, path = http.MethodGet, "/teams/:teamID/members"
 
 	permissive := BlockedTeamAllowlist{method: {path: {}}}
@@ -126,10 +126,10 @@ func TestCheckTeamAccess(t *testing.T) {
 		http.MethodGet: {"/sandboxes": {}},
 	}
 
-	cleanTeam := types.NewTeam(authqueries.GetTeamByTeamIDRow{})
-	bannedTeam := types.NewTeam(authqueries.GetTeamByTeamIDRow{IsBanned: true})
-	blockedTeam := types.NewTeam(authqueries.GetTeamByTeamIDRow{IsBlocked: true, BlockedReason: &reason})
-	bannedAndBlockedTeam := types.NewTeam(authqueries.GetTeamByTeamIDRow{IsBanned: true, IsBlocked: true, BlockedReason: &reason})
+	cleanTeam := &types.Team{Team: &teamdata.Team{}}
+	bannedTeam := &types.Team{Team: &teamdata.Team{IsBanned: true}}
+	blockedTeam := &types.Team{Team: &teamdata.Team{IsBlocked: true, BlockedReason: &reason}}
+	bannedAndBlockedTeam := &types.Team{Team: &teamdata.Team{IsBanned: true, IsBlocked: true, BlockedReason: &reason}}
 
 	wantForbidden := func(t *testing.T, err error) {
 		t.Helper()
@@ -235,6 +235,74 @@ func runCheckTeamAccess(
 	r.ServeHTTP(httptest.NewRecorder(), httptest.NewRequestWithContext(t.Context(), method, concretePath(fullPath), nil))
 
 	return gotErr
+}
+
+// A viewer reads and does nothing else. A role this build has never heard of
+// is held to the same, and a team resolved without a user is not restricted.
+func TestEnforceReadOnlyMember(t *testing.T) {
+	t.Parallel()
+
+	deniedReads := ReadOnlyDeniedReads{
+		http.MethodGet: {"/templates/:templateID/files/:hash": {}},
+	}
+	withRole := func(role string) *types.Team {
+		team := &types.Team{Team: &teamdata.Team{}}
+		team.Role = role
+
+		return team
+	}
+
+	cases := []struct {
+		name     string
+		method   string
+		fullPath string
+		team     *types.Team
+		wantRan  bool
+	}{
+		{name: "no team on context passes", method: http.MethodPost, fullPath: "/sandboxes", wantRan: true},
+		{name: "api key writes", method: http.MethodPost, fullPath: "/sandboxes", team: withRole(""), wantRan: true},
+		{name: "owner writes", method: http.MethodPost, fullPath: "/sandboxes", team: withRole(types.TeamRoleOwner), wantRan: true},
+		{name: "member writes", method: http.MethodDelete, fullPath: "/sandboxes/:sandboxID", team: withRole(types.TeamRoleMember), wantRan: true},
+		{name: "viewer reads", method: http.MethodGet, fullPath: "/sandboxes", team: withRole(types.TeamRoleViewer), wantRan: true},
+		{name: "viewer denied post", method: http.MethodPost, fullPath: "/sandboxes", team: withRole(types.TeamRoleViewer)},
+		{name: "viewer denied put", method: http.MethodPut, fullPath: "/sandboxes/:sandboxID/network", team: withRole(types.TeamRoleViewer)},
+		{name: "viewer denied patch", method: http.MethodPatch, fullPath: "/api-keys/:apiKeyID", team: withRole(types.TeamRoleViewer)},
+		{name: "viewer denied delete", method: http.MethodDelete, fullPath: "/sandboxes/:sandboxID", team: withRole(types.TeamRoleViewer)},
+		{name: "viewer denied a read that writes", method: http.MethodGet, fullPath: "/templates/:templateID/files/:hash", team: withRole(types.TeamRoleViewer)},
+		{name: "member reaches a read that writes", method: http.MethodGet, fullPath: "/templates/:templateID/files/:hash", team: withRole(types.TeamRoleMember), wantRan: true},
+		{name: "unknown role reads", method: http.MethodGet, fullPath: "/sandboxes", team: withRole("auditor"), wantRan: true},
+		{name: "unknown role denied post", method: http.MethodPost, fullPath: "/sandboxes", team: withRole("auditor")},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			ran := false
+			r := gin.New()
+			r.Handle(tc.method, tc.fullPath, func(c *gin.Context) {
+				if tc.team != nil {
+					authcontext.SetTeamInfo(c, tc.team)
+				}
+				EnforceReadOnlyMember(deniedReads)(c)
+				if !c.IsAborted() {
+					ran = true
+					c.Status(http.StatusOK)
+				}
+			})
+
+			w := httptest.NewRecorder()
+			r.ServeHTTP(w, httptest.NewRequestWithContext(t.Context(), tc.method, concretePath(tc.fullPath), nil))
+
+			assert.Equal(t, tc.wantRan, ran)
+			if tc.wantRan {
+				assert.Equal(t, http.StatusOK, w.Code)
+			} else {
+				assert.Equal(t, http.StatusForbidden, w.Code)
+				assert.Contains(t, w.Body.String(), "read-only")
+			}
+		})
+	}
 }
 
 func runEnforceBlockedTeam(

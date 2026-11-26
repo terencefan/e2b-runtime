@@ -20,6 +20,32 @@ import (
 
 var tracer = otel.Tracer("github.com/e2b-dev/infra/packages/api/internal/handlers")
 
+// sandboxCreator is the orchestrator's start, as startSandboxInternal calls it.
+type sandboxCreator interface {
+	CreateSandbox(
+		ctx context.Context,
+		sandboxID,
+		executionID string,
+		team *typesteam.Team,
+		getSandboxData orchestrator.SandboxDataFetcher,
+		startTime time.Time,
+		endTime time.Time,
+		timeout time.Duration,
+		isResume bool,
+		demandFilesystemBoot bool,
+		creationMeta sandbox.CreationMetadata,
+		options ...orchestrator.CreateOption,
+	) (sandbox.Sandbox, *api.APIError)
+}
+
+func (a *APIStore) createBackend() sandboxCreator {
+	if a.createBackendOverride != nil {
+		return a.createBackendOverride
+	}
+
+	return a.orchestrator
+}
+
 func (a *APIStore) startSandbox(
 	ctx context.Context,
 	sandboxID string,
@@ -48,7 +74,7 @@ func (a *APIStore) startSandbox(
 		return nil, apiErr
 	}
 
-	return sbx.ToAPISandbox(), nil
+	return toAPISandbox(sbx), nil
 }
 
 // startSandboxInternal starts the sandbox and returns the internal sandbox model (includes routing info).
@@ -72,7 +98,7 @@ func (a *APIStore) startSandboxInternal(
 
 	creationMeta := buildCreationMetadata(team, requestHeader, isResume, mcp)
 
-	sbx, instanceErr := a.orchestrator.CreateSandbox(
+	sbx, instanceErr := a.createBackend().CreateSandbox(
 		ctx,
 		sandboxID,
 		executionID,
@@ -103,6 +129,21 @@ func (a *APIStore) startSandboxInternal(
 	)
 
 	return sbx, nil
+}
+
+func toAPISandbox(sbx sandbox.Sandbox) *api.Sandbox {
+	return &api.Sandbox{
+		SandboxID:          sbx.SandboxID,
+		TemplateID:         sbx.BaseTemplateID,
+		ClientID:           sbx.ClientID,
+		Alias:              sbx.Alias,
+		EnvdVersion:        sbx.EnvdVersion,
+		EnvdAccessToken:    sbx.EnvdAccessToken,
+		TrafficAccessToken: sbx.TrafficAccessToken,
+		Domain:             sbx.Domain,
+		CpuCount:           new(api.CPUCount(sbx.VCpu)),
+		MemoryMB:           new(api.MemoryMB(sbx.TotalMemoryMB())),
+	}
 }
 
 func buildCreationMetadata(

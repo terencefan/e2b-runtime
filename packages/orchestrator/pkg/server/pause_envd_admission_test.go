@@ -24,6 +24,8 @@ import (
 
 	internalevents "github.com/e2b-dev/infra/packages/orchestrator/pkg/events"
 	"github.com/e2b-dev/infra/packages/orchestrator/pkg/sandbox"
+	"github.com/e2b-dev/infra/packages/orchestrator/pkg/sandbox/build"
+	"github.com/e2b-dev/infra/packages/orchestrator/pkg/template/metadata"
 	"github.com/e2b-dev/infra/packages/shared/pkg/featureflags"
 	"github.com/e2b-dev/infra/packages/shared/pkg/grpc/orchestrator"
 	"github.com/e2b-dev/infra/packages/shared/pkg/storage/header"
@@ -31,9 +33,17 @@ import (
 	"github.com/e2b-dev/infra/packages/shared/pkg/utils"
 )
 
-// envdProbeMs is the probe timeout the tests enable. Each test serves envd for
-// its sandbox from its own test server (registerEnvd), so nothing is shared.
-const envdProbeMs = 100
+// envdFailingProbeMs is the probe timeout for tests whose envd does not answer
+// healthy.
+const envdFailingProbeMs = 100
+
+// envdAnsweringProbeMs is the probe timeout for tests whose envd answers, long
+// enough that a loaded runner does not turn the answer into a miss.
+const envdAnsweringProbeMs = 5000
+
+// markStoppingWait is how long a test waits for an admitted pause or
+// checkpoint to leave the live map, longer than the probe it may wait on.
+const markStoppingWait = envdAnsweringProbeMs*time.Millisecond + 2*time.Second
 
 // envdAnswer is how a test's envd answers /health: a status, a status after a
 // delay, or no listener (the connection is dropped).
@@ -134,7 +144,7 @@ func awaitPauseCrossedMarkStopping(t *testing.T, s *Server, sbx *sandbox.Sandbox
 		_, live := s.sandboxFactory.Sandboxes.Get(sbx.Runtime.SandboxID)
 
 		return !live
-	}, 2*time.Second, time.Millisecond, msg)
+	}, markStoppingWait, time.Millisecond, msg)
 	require.Eventually(t, func() bool {
 		return sbx.GetStopReason() == sandbox.StopReasonPaused
 	}, 2*time.Second, time.Millisecond)
@@ -149,6 +159,9 @@ type fakePauseSteps struct {
 	stops            atomic.Int32
 	filesystemOnly   atomic.Bool
 	envdUnresponsive atomic.Bool
+	// seal, when set, backs the snapshot's rootfs diff: a harvest then waits on
+	// it instead of resuming, until the test settles it.
+	seal *utils.SetOnce[build.Diff]
 }
 
 func (f *fakePauseSteps) snapshot(_ context.Context, _ *sandbox.Sandbox, in *orchestrator.SandboxPauseRequest, filesystemOnly, _, envdUnresponsive bool) (*snapshotResult, error) {
@@ -156,10 +169,18 @@ func (f *fakePauseSteps) snapshot(_ context.Context, _ *sandbox.Sandbox, in *orc
 	f.filesystemOnly.Store(filesystemOnly)
 	f.envdUnresponsive.Store(envdUnresponsive)
 
+	var rootfsDiff build.Diff = &build.NoDiff{}
+	if f.seal != nil {
+		rootfsDiff = build.NewDeferredDiff("rootfs", 4096, f.seal)
+	}
+
 	return &snapshotResult{
+		// Stamped as the real snapshot stamps it, so the harvest reads the mark.
+		meta:               metadata.Template{}.MarkEnvdUnresponsive(envdUnresponsive),
 		schedulingMetadata: &orchestrator.SchedulingMetadata{BuildId: in.GetBuildId()},
 		completeUpload:     func(context.Context, error) {},
 		abandonUpload:      func(context.Context, error) {},
+		rootfsDiff:         rootfsDiff,
 		filesystemOnly:     filesystemOnly,
 	}, nil
 }
@@ -188,7 +209,7 @@ func envdProbePauseServer(t *testing.T, envdMs *int) (*Server, *sdkmetric.Manual
 func TestPause_EnvdUnresponsiveProceedsWhenAllowed(t *testing.T) {
 	t.Parallel()
 
-	s, reader := envdProbePauseServer(t, new(envdProbeMs))
+	s, reader := envdProbePauseServer(t, new(envdFailingProbeMs))
 	sbx := envdProbeSandbox(t, "sbx-envd-pause-proceed", 30)
 	answer := &envdAnswer{unreachable: true, begun: make(chan struct{})}
 	registerEnvd(t, sbx, answer)
@@ -200,7 +221,7 @@ func TestPause_EnvdUnresponsiveProceedsWhenAllowed(t *testing.T) {
 	select {
 	case <-answer.begun:
 	default:
-		t.Fatal("the guest must still be probed")
+		require.Fail(t, "the guest must still be probed")
 	}
 	assert.True(t, resp.GetEnvdUnresponsive(), "the response must report the miss the API persists")
 	assert.Equal(t, "build-1", resp.GetSchedulingMetadata().GetBuildId())
@@ -216,6 +237,7 @@ func TestPause_EnvdUnresponsiveProceedsWhenAllowed(t *testing.T) {
 	attrs := attrsAsMap(t, points[0].Attributes)
 	assert.Equal(t, string(sandbox.SnapshotAdmissionEnvdUnhealthyProceeded), attrs["outcome"])
 	assert.Equal(t, "pause", attrs["rpc"])
+	assert.Equal(t, string(envdProbeUnanswered), attrs["cause"], "a proceeded pause names the miss it went past")
 	waits := admissionWaitPoints(t, reader)
 	require.Len(t, waits, 1)
 	assert.Equal(t, string(sandbox.SnapshotAdmissionEnvdUnhealthyProceeded), attrsAsMap(t, waits[0].Attributes)["outcome"])
@@ -230,7 +252,7 @@ func TestPause_EnvdUnresponsiveRefusesBeforeMarkStoppingByDefault(t *testing.T) 
 	t.Parallel()
 
 	s, reader := admissionMetricsServer(t, -1)
-	s.featureFlags = envdProbeFlagClient(t, new(envdProbeMs))
+	s.featureFlags = envdProbeFlagClient(t, new(envdFailingProbeMs))
 	sbx := envdProbeSandbox(t, "sbx-envd-pause", 31)
 	registerEnvd(t, sbx, &envdAnswer{unreachable: true})
 	s.sandboxFactory.Sandboxes.MarkRunning(t.Context(), sbx)
@@ -249,9 +271,83 @@ func TestPause_EnvdUnresponsiveRefusesBeforeMarkStoppingByDefault(t *testing.T) 
 	attrs := attrsAsMap(t, points[0].Attributes)
 	assert.Equal(t, string(sandbox.SnapshotAdmissionEnvdUnhealthy), attrs["outcome"])
 	assert.Equal(t, "pause", attrs["rpc"])
+	assert.Equal(t, string(envdProbeUnanswered), attrs["cause"])
 	waits := admissionWaitPoints(t, reader)
 	require.Len(t, waits, 1)
 	assert.Equal(t, string(sandbox.SnapshotAdmissionEnvdUnhealthy), attrsAsMap(t, waits[0].Attributes)["outcome"])
+}
+
+// envdProbeHarvestFlagClient is envdProbeFlagClient with the prefetch harvest
+// enabled on a one-second budget, so a pause schedules the harvest.
+func envdProbeHarvestFlagClient(t *testing.T, envdMs int) *featureflags.Client {
+	t.Helper()
+
+	td := ldtestdata.DataSource()
+	td.Update(td.Flag(featureflags.PauseEnvdHealthTimeoutMs.Key()).ValueForAll(ldvalue.Int(envdMs)))
+	td.Update(td.Flag(featureflags.PauseResumePrefetchHarvestFlag.Key()).VariationForAll(true))
+	td.Update(td.Flag(featureflags.PauseResumePrefetchHarvestTimeoutMsFlag.Key()).ValueForAll(ldvalue.Int(1000)))
+	ff, err := featureflags.NewClientWithDatasource(td)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = ff.Close(context.WithoutCancel(t.Context())) })
+
+	return ff
+}
+
+// The mark a missed probe stamps on the snapshot reaches the harvest through
+// the handler: a pause over an unresponsive guest counts the skip and
+// schedules nothing, while a pause whose guest answered schedules the harvest,
+// which waits on the snapshot's seal and counts an attempt that is not the
+// skip once the seal settles.
+func TestPause_EnvdUnresponsiveSkipsThePrefetchHarvest(t *testing.T) {
+	t.Parallel()
+
+	for _, tc := range []struct {
+		name      string
+		answer    *envdAnswer
+		harvested bool
+	}{
+		{name: "unresponsive guest is not harvested", answer: &envdAnswer{unreachable: true}},
+		{name: "healthy guest is harvested", answer: &envdAnswer{status: http.StatusNoContent}, harvested: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			teamID := harvestTeamID("pause-harvest")
+			s, _ := envdProbePauseServer(t, new(envdAnsweringProbeMs))
+			s.featureFlags = envdProbeHarvestFlagClient(t, envdAnsweringProbeMs)
+			sbx := envdProbeSandbox(t, "sbx-"+teamID, 36)
+			sbx.Runtime.TeamID = teamID
+			registerEnvd(t, sbx, tc.answer)
+			s.sandboxFactory.Sandboxes.MarkRunning(t.Context(), sbx)
+
+			steps := &fakePauseSteps{seal: utils.NewSetOnce[build.Diff]()}
+			resp, pauseErr := s.pauseWith(t.Context(), &orchestrator.SandboxPauseRequest{SandboxId: sbx.Runtime.SandboxID, BuildId: "build-1", AllowEnvdUnresponsive: true}, steps)
+			require.NoError(t, pauseErr)
+			require.Equal(t, !tc.harvested, resp.GetEnvdUnresponsive())
+			require.Equal(t, !tc.harvested, steps.envdUnresponsive.Load(), "the snapshot carries the probe's verdict")
+
+			if !tc.harvested {
+				// The skip is counted before the handler returns; nothing waits on the seal.
+				points := harvestAttemptsForTeam(t, teamID)
+				require.Len(t, points, 1, "exactly one attempt is counted for a marked pause")
+				assert.Equal(t, string(harvestGuestUnresponsive), attrsAsMap(t, points[0].Attributes)["result"])
+				assert.Equal(t, string(harvestSourcePause), attrsAsMap(t, points[0].Attributes)["path"])
+				require.Eventually(t, func() bool { return s.info.OutstandingWork() == 0 }, 2*time.Second, time.Millisecond)
+				assert.Len(t, harvestAttemptsForTeam(t, teamID), 1, "nothing else is counted once the pause's detached work drains")
+
+				return
+			}
+
+			// Settle the seal as failed so the scheduled harvest books its attempt
+			// without ever reaching the factory; what it books is not the skip.
+			require.NoError(t, steps.seal.SetError(build.ErrDeferredSealFailed))
+			require.Eventually(t, func() bool { return s.info.OutstandingWork() == 0 }, 2*time.Second, time.Millisecond)
+			points := harvestAttemptsForTeam(t, teamID)
+			require.Len(t, points, 1, "the harvest was scheduled and counted one attempt")
+			assert.Equal(t, string(harvestSkipped), attrsAsMap(t, points[0].Attributes)["result"], "a healthy guest's harvest is never the guest_unresponsive skip")
+			assert.Equal(t, string(harvestSourcePause), attrsAsMap(t, points[0].Attributes)["path"])
+		})
+	}
 }
 
 // An envd that answers admits the pause: it runs to its response, which
@@ -260,7 +356,7 @@ func TestPause_EnvdUnresponsiveRefusesBeforeMarkStoppingByDefault(t *testing.T) 
 func TestPause_EnvdHealthyAdmits(t *testing.T) {
 	t.Parallel()
 
-	s, reader := envdProbePauseServer(t, new(envdProbeMs))
+	s, reader := envdProbePauseServer(t, new(envdAnsweringProbeMs))
 	sbx := envdProbeSandbox(t, "sbx-envd-pause-healthy", 32)
 	registerEnvd(t, sbx, &envdAnswer{status: http.StatusNoContent})
 	s.sandboxFactory.Sandboxes.MarkRunning(t.Context(), sbx)
@@ -275,7 +371,9 @@ func TestPause_EnvdHealthyAdmits(t *testing.T) {
 	assert.False(t, live, "the pause crossed MarkStopping")
 	points := admissionCounterPoints(t, reader)
 	require.Len(t, points, 1)
-	assert.Equal(t, string(sandbox.SnapshotAdmissionEnvdHealthy), attrsAsMap(t, points[0].Attributes)["outcome"])
+	attrs := attrsAsMap(t, points[0].Attributes)
+	assert.Equal(t, string(sandbox.SnapshotAdmissionEnvdHealthy), attrs["outcome"])
+	assert.NotContains(t, attrs, "cause", "an admitted probe names no cause")
 }
 
 // A filesystem-only pause is always strict, whatever the request says: its
@@ -297,7 +395,7 @@ func TestPause_FilesystemOnlyIsRefusedOnAMissRegardless(t *testing.T) {
 			t.Parallel()
 
 			s, reader := admissionMetricsServer(t, -1)
-			s.featureFlags = envdProbeFlagClient(t, new(envdProbeMs))
+			s.featureFlags = envdProbeFlagClient(t, new(envdFailingProbeMs))
 			sandboxID := "sbx-envd-pause-fs-only-" + name
 			sbx := envdProbeSandbox(t, sandboxID, c.slot)
 			registerEnvd(t, sbx, &envdAnswer{unreachable: true})
@@ -315,6 +413,7 @@ func TestPause_FilesystemOnlyIsRefusedOnAMissRegardless(t *testing.T) {
 			attrs := attrsAsMap(t, points[0].Attributes)
 			assert.Equal(t, string(sandbox.SnapshotAdmissionEnvdUnhealthy), attrs["outcome"])
 			assert.Equal(t, "pause", attrs["rpc"])
+			assert.Equal(t, string(envdProbeUnanswered), attrs["cause"])
 		})
 	}
 }
@@ -325,7 +424,7 @@ func TestPause_FilesystemOnlyEnvdHealthyAdmits(t *testing.T) {
 	t.Parallel()
 
 	s, reader := admissionMetricsServer(t, -1)
-	s.featureFlags = envdProbeFlagClient(t, new(envdProbeMs))
+	s.featureFlags = envdProbeFlagClient(t, new(envdAnsweringProbeMs))
 	sbx := envdProbeSandbox(t, "sbx-envd-pause-fs-only-ok", 34)
 	registerEnvd(t, sbx, &envdAnswer{status: http.StatusNoContent})
 	s.sandboxFactory.Sandboxes.MarkRunning(t.Context(), sbx)
@@ -337,7 +436,9 @@ func TestPause_FilesystemOnlyEnvdHealthyAdmits(t *testing.T) {
 	awaitPauseCrossedMarkStopping(t, s, sbx, "a healthy guest's filesystem-only pause must proceed")
 	points := admissionCounterPoints(t, reader)
 	require.Len(t, points, 1)
-	assert.Equal(t, string(sandbox.SnapshotAdmissionEnvdHealthy), attrsAsMap(t, points[0].Attributes)["outcome"])
+	attrs := attrsAsMap(t, points[0].Attributes)
+	assert.Equal(t, string(sandbox.SnapshotAdmissionEnvdHealthy), attrs["outcome"])
+	assert.NotContains(t, attrs, "cause", "an admitted probe names no cause")
 }
 
 // Flag absent, negative or zero means no probe: with envd unreachable the
@@ -417,7 +518,8 @@ func TestPause_EnvdProbeMissWhileACheckpointClaimsTheSandboxIsRetryable(t *testi
 	s, sbx, steps, _ := slowResumeServer(t)
 	defer steps.releaseAll()
 	s.featureFlags = envdProbeFlagClient(t, new(300))
-	meter := sdkmetric.NewMeterProvider(sdkmetric.WithReader(sdkmetric.NewManualReader())).Meter("github.com/e2b-dev/infra/packages/orchestrator/pkg/server")
+	reader := sdkmetric.NewManualReader()
+	meter := sdkmetric.NewMeterProvider(sdkmetric.WithReader(reader)).Meter("github.com/e2b-dev/infra/packages/orchestrator/pkg/server")
 	s.pauseAdmissionCounter = utils.Must(telemetry.GetCounter(meter, telemetry.OrchestratorSandboxPauseAdmissionCounterName))
 	s.pauseAdmissionWaitDuration = utils.Must(telemetry.GetHistogram(meter, telemetry.OrchestratorSandboxPauseAdmissionWaitDurationName))
 	sbx.SetChecks(sandbox.NewChecks(sbx))
@@ -432,7 +534,7 @@ func TestPause_EnvdProbeMissWhileACheckpointClaimsTheSandboxIsRetryable(t *testi
 	select {
 	case <-answer.begun:
 	case <-time.After(5 * time.Second):
-		t.Fatal("the probe never reached the guest")
+		require.Fail(t, "the probe never reached the guest")
 	}
 
 	done := startSlowCheckpoint(t.Context(), s, steps, sbx)
@@ -442,11 +544,16 @@ func TestPause_EnvdProbeMissWhileACheckpointClaimsTheSandboxIsRetryable(t *testi
 	select {
 	case err = <-pauseErr:
 	case <-time.After(5 * time.Second):
-		t.Fatal("the pause never answered")
+		require.Fail(t, "the pause never answered")
 	}
 	assert.Equal(t, codes.ResourceExhausted, status.Code(err))
 	assert.NotNil(t, checkpointInProgressDetail(t, err), "the hold, not the guest, is the reason the API acts on")
 	assert.Nil(t, envdUnresponsiveDetail(t, err))
+	points := admissionCounterPoints(t, reader)
+	require.Len(t, points, 1)
+	attrs := attrsAsMap(t, points[0].Attributes)
+	assert.Equal(t, string(sandbox.SnapshotAdmissionEnvdUnhealthy), attrs["outcome"])
+	assert.Equal(t, string(envdProbeCheckpointInFlight), attrs["cause"], "the detached claim is the cause, not the guest")
 
 	steps.releaseResume()
 	awaitCheckpoint(t, done)
@@ -461,7 +568,7 @@ func TestPause_EnvdProbeMissAfterTheVMExitedIsNotFound(t *testing.T) {
 	t.Parallel()
 
 	s, reader := admissionMetricsServer(t, -1)
-	s.featureFlags = envdProbeFlagClient(t, new(envdProbeMs))
+	s.featureFlags = envdProbeFlagClient(t, new(envdFailingProbeMs))
 	sbx := envdProbeSandbox(t, "sbx-envd-exited", 78)
 	registerEnvd(t, sbx, &envdAnswer{unreachable: true})
 	s.sandboxFactory.Sandboxes.MarkRunning(t.Context(), sbx)
@@ -476,7 +583,9 @@ func TestPause_EnvdProbeMissAfterTheVMExitedIsNotFound(t *testing.T) {
 
 	points := admissionCounterPoints(t, reader)
 	require.Len(t, points, 1, "the probe decision is still counted")
-	assert.Equal(t, string(sandbox.SnapshotAdmissionEnvdUnhealthy), attrsAsMap(t, points[0].Attributes)["outcome"])
+	attrs := attrsAsMap(t, points[0].Attributes)
+	assert.Equal(t, string(sandbox.SnapshotAdmissionEnvdUnhealthy), attrs["outcome"])
+	assert.Equal(t, string(envdProbeExited), attrs["cause"])
 }
 
 // Only the probed execution's exit counts. When a checkpoint resumes the
@@ -488,7 +597,7 @@ func TestPause_EnvdProbeMissAfterTheVMExitedIsNotFound(t *testing.T) {
 func TestPause_EnvdProbeMissAfterASuccessorTookTheIDIsRetryable(t *testing.T) {
 	t.Parallel()
 
-	s, _ := admissionMetricsServer(t, -1)
+	s, reader := admissionMetricsServer(t, -1)
 	s.featureFlags = envdProbeFlagClient(t, new(2000))
 	sbx := envdProbeSandbox(t, "sbx-envd-successor", 79)
 	answer := &envdAnswer{status: http.StatusNoContent, delay: time.Hour, begun: make(chan struct{})}
@@ -503,7 +612,7 @@ func TestPause_EnvdProbeMissAfterASuccessorTookTheIDIsRetryable(t *testing.T) {
 	select {
 	case <-answer.begun:
 	case <-time.After(5 * time.Second):
-		t.Fatal("the probe never reached the guest")
+		require.Fail(t, "the probe never reached the guest")
 	}
 
 	// The probed execution ends and a fresh one takes its ID.
@@ -517,12 +626,17 @@ func TestPause_EnvdProbeMissAfterASuccessorTookTheIDIsRetryable(t *testing.T) {
 	select {
 	case err = <-pauseErr:
 	case <-time.After(5 * time.Second):
-		t.Fatal("the pause never answered")
+		require.Fail(t, "the pause never answered")
 	}
 	requireEnvdUnresponsive(t, err)
 	cur, live := s.sandboxFactory.Sandboxes.Get("sbx-envd-successor")
 	assert.True(t, live, "the successor stays live")
 	assert.Same(t, successor, cur)
+	points := admissionCounterPoints(t, reader)
+	require.Len(t, points, 1)
+	attrs := attrsAsMap(t, points[0].Attributes)
+	assert.Equal(t, string(sandbox.SnapshotAdmissionEnvdUnhealthy), attrs["outcome"])
+	assert.Equal(t, string(envdProbeSuperseded), attrs["cause"], "the successor, not the guest, is the cause")
 }
 
 // A probe miss while an in-place checkpoint has the guest frozen is the
@@ -535,7 +649,7 @@ func TestPause_EnvdProbeMissDuringAnInPlaceCheckpointAnswersTheHold(t *testing.T
 	t.Parallel()
 
 	s, reader := admissionMetricsServer(t, -1)
-	s.featureFlags = envdProbeFlagClient(t, new(envdProbeMs))
+	s.featureFlags = envdProbeFlagClient(t, new(envdFailingProbeMs))
 	sbx := envdProbeSandbox(t, "sbx-envd-inplace", 82)
 	registerEnvd(t, sbx, &envdAnswer{unreachable: true})
 	s.sandboxFactory.Sandboxes.MarkRunning(t.Context(), sbx)
@@ -552,5 +666,102 @@ func TestPause_EnvdProbeMissDuringAnInPlaceCheckpointAnswersTheHold(t *testing.T
 	assert.True(t, live, "the sandbox is untouched")
 	points := admissionCounterPoints(t, reader)
 	require.Len(t, points, 1, "the probe decision is still counted")
-	assert.Equal(t, string(sandbox.SnapshotAdmissionEnvdUnhealthy), attrsAsMap(t, points[0].Attributes)["outcome"])
+	attrs := attrsAsMap(t, points[0].Attributes)
+	assert.Equal(t, string(sandbox.SnapshotAdmissionEnvdUnhealthy), attrs["outcome"])
+	assert.Equal(t, string(envdProbeCheckpointInFlight), attrs["cause"])
+}
+
+// A reboot in place that takes the sandbox while the probe waits is answered
+// with the reboot's retryable refusal, never NotFound, so the API keeps the
+// record for the boot's successor; the decision is counted as envd_unhealthy
+// with the reboot as its cause. The handler orders the events: the boot
+// begins before envd answers.
+func TestPause_EnvdProbeMissWhileARebootTakesTheSandboxIsRetryable(t *testing.T) {
+	t.Parallel()
+
+	s, reader := admissionMetricsServer(t, -1)
+	s.featureFlags = envdProbeFlagClient(t, new(envdFailingProbeMs))
+	sbx := envdProbeSandbox(t, "sbx-envd-reboot", 98)
+	require.NoError(t, s.sandboxFactory.Sandboxes.MarkRunning(t.Context(), sbx))
+
+	booted := make(chan func(*sandbox.Sandbox) (string, error), 1)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		end, err := s.sandboxFactory.Sandboxes.BeginBootForTest(r.Context(), sbx)
+		if err == nil {
+			booted <- end
+		}
+		w.WriteHeader(http.StatusServiceUnavailable)
+	}))
+	t.Cleanup(srv.Close)
+	sbx.SetEnvdServerURLForTest(srv.URL)
+
+	_, pauseErr := s.Pause(t.Context(), &orchestrator.SandboxPauseRequest{SandboxId: "sbx-envd-reboot", AllowEnvdUnresponsive: true})
+	assert.Equal(t, codes.ResourceExhausted, status.Code(pauseErr))
+	require.ErrorContains(t, pauseErr, "rebooting, please retry")
+	assert.Nil(t, envdUnresponsiveDetail(t, pauseErr), "the reboot, not the guest, is the reason the API acts on")
+
+	select {
+	case end := <-booted:
+		_, err := end(nil)
+		require.NoError(t, err)
+	default:
+		require.Fail(t, "the reboot never took the sandbox")
+	}
+	points := admissionCounterPoints(t, reader)
+	require.Len(t, points, 1, "the probe decision is still counted")
+	attrs := attrsAsMap(t, points[0].Attributes)
+	assert.Equal(t, string(sandbox.SnapshotAdmissionEnvdUnhealthy), attrs["outcome"])
+	assert.Equal(t, string(envdProbeRebooting), attrs["cause"])
+}
+
+// A sandbox another caller delisted while the probe waited, without its
+// execution exiting, is gone: the answer is NotFound and the decision is
+// counted as envd_unhealthy with not_found as its cause, apart from the exit
+// of a VM that died.
+func TestPause_EnvdProbeMissAfterTheSandboxWasDelistedIsNotFound(t *testing.T) {
+	t.Parallel()
+
+	s, reader := admissionMetricsServer(t, -1)
+	s.featureFlags = envdProbeFlagClient(t, new(envdFailingProbeMs))
+	sbx := envdProbeSandbox(t, "sbx-envd-delisted", 99)
+	require.NoError(t, s.sandboxFactory.Sandboxes.MarkRunning(t.Context(), sbx))
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		s.sandboxFactory.Sandboxes.MarkStopping(r.Context(), "sbx-envd-delisted", sbx.LifecycleID)
+		w.WriteHeader(http.StatusServiceUnavailable)
+	}))
+	t.Cleanup(srv.Close)
+	sbx.SetEnvdServerURLForTest(srv.URL)
+
+	_, pauseErr := s.Pause(t.Context(), &orchestrator.SandboxPauseRequest{SandboxId: "sbx-envd-delisted", AllowEnvdUnresponsive: true})
+	assert.Equal(t, codes.NotFound, status.Code(pauseErr), "a delisted sandbox is answered as gone: %s", pauseErr)
+	assert.Nil(t, envdUnresponsiveDetail(t, pauseErr))
+
+	points := admissionCounterPoints(t, reader)
+	require.Len(t, points, 1, "the probe decision is still counted")
+	attrs := attrsAsMap(t, points[0].Attributes)
+	assert.Equal(t, string(sandbox.SnapshotAdmissionEnvdUnhealthy), attrs["outcome"])
+	assert.Equal(t, string(envdProbeNotFound), attrs["cause"])
+}
+
+// The cause attribute belongs to the probe's two not-admitted outcomes
+// only: a caller that names one on any other outcome records it without,
+// so the sums by outcome and rpc every existing reader takes stay whole.
+func TestRecordAdmission_CauseIsKeptOnTheNotAdmittedOutcomesOnly(t *testing.T) {
+	t.Parallel()
+
+	s, reader := admissionMetricsServer(t, -1)
+	s.recordAdmission(t.Context(), "team", "pause", sandbox.SnapshotAdmissionRefused, envdProbeUnanswered, 0)
+	s.recordAdmission(t.Context(), "team", "pause", sandbox.SnapshotAdmissionEnvdHealthy, envdProbeUnanswered, 0)
+	s.recordAdmission(t.Context(), "team", "pause", sandbox.SnapshotAdmissionEnvdUnhealthy, envdProbeUnanswered, 0)
+	s.recordAdmission(t.Context(), "team", "pause", sandbox.SnapshotAdmissionEnvdUnhealthyProceeded, envdProbeUnanswered, 0)
+
+	points := admissionCounterPoints(t, reader)
+	require.Len(t, points, 4)
+	for _, point := range points {
+		attrs := attrsAsMap(t, point.Attributes)
+		_, withCause := attrs["cause"]
+		notAdmitted := attrs["outcome"] == string(sandbox.SnapshotAdmissionEnvdUnhealthy) || attrs["outcome"] == string(sandbox.SnapshotAdmissionEnvdUnhealthyProceeded)
+		assert.Equal(t, notAdmitted, withCause, "outcome %s", attrs["outcome"])
+	}
 }

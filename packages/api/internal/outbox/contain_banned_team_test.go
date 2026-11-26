@@ -14,13 +14,13 @@ import (
 	"github.com/stretchr/testify/mock"
 	"github.com/stretchr/testify/require"
 
+	dbmodule "github.com/e2b-dev/infra/packages/api/internal/db"
+	"github.com/e2b-dev/infra/packages/api/internal/db/pkg/outbox"
+	"github.com/e2b-dev/infra/packages/api/internal/db/pkg/testutils"
 	"github.com/e2b-dev/infra/packages/api/internal/sandbox"
 	"github.com/e2b-dev/infra/packages/api/internal/team"
 	teammocks "github.com/e2b-dev/infra/packages/api/internal/team/mocks"
 	template_manager "github.com/e2b-dev/infra/packages/api/internal/template-manager"
-	dbmodule "github.com/e2b-dev/infra/packages/db"
-	"github.com/e2b-dev/infra/packages/db/pkg/outbox"
-	"github.com/e2b-dev/infra/packages/db/pkg/testutils"
 	"github.com/e2b-dev/infra/packages/shared/pkg/sharedriver"
 )
 
@@ -253,6 +253,6 @@ func TestContainBannedTeamRunsThroughTheOutboxClient(t *testing.T) {
 	case event := <-snoozed:
 		require.Equal(t, inserted.Job.ID, event.Job.ID)
 	case <-time.After(30 * time.Second):
-		t.Fatal("the containment job did not run")
+		require.Fail(t, "the containment job did not run")
 	}
 }

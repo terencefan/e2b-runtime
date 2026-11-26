@@ -10,9 +10,9 @@ import (
 	"github.com/google/uuid"
 
 	"github.com/e2b-dev/infra/packages/api/internal/api"
+	"github.com/e2b-dev/infra/packages/api/internal/db/queries"
 	"github.com/e2b-dev/infra/packages/api/internal/utils"
-	"github.com/e2b-dev/infra/packages/db/pkg/dberrors"
-	"github.com/e2b-dev/infra/packages/db/queries"
+	"github.com/e2b-dev/infra/packages/shared/pkg/postgres/dberrors"
 	"github.com/e2b-dev/infra/packages/shared/pkg/telemetry"
 	sharedUtils "github.com/e2b-dev/infra/packages/shared/pkg/utils"
 )
@@ -116,6 +116,8 @@ func (a *APIStore) GetTemplatesTemplateID(c *gin.Context, templateID api.Templat
 		BuildID:              defaultBuild.BuildID,
 		BuildVcpu:            defaultBuild.BuildVcpu,
 		BuildMaxVcpu:         defaultBuild.BuildMaxVcpu,
+		BuildMaxRamMb:        defaultBuild.BuildMaxRamMb,
+		BuildStartMemoryMb:   defaultBuild.BuildStartMemoryMb,
 		BuildRamMb:           defaultBuild.BuildRamMb,
 		BuildTotalDiskSizeMb: defaultBuild.BuildTotalDiskSizeMb,
 		BuildEnvdVersion:     defaultBuild.BuildEnvdVersion,
@@ -137,7 +139,8 @@ func templateBuildToAPI(ctx context.Context, build queries.EnvBuild) api.Templat
 		FinishedAt:  build.FinishedAt,
 		CpuCount:    api.CPUCount(build.Vcpu),
 		MaxCpuCount: sharedUtils.CastPtr(build.MaxVcpu, func(v int64) api.CPUCount { return api.CPUCount(v) }),
-		MemoryMB:    api.MemoryMB(build.RamMb),
+		MaxMemoryMB: sharedUtils.CastPtr(build.MaxRamMb, func(v int64) api.MemoryMB { return api.MemoryMB(v) }),
+		MemoryMB:    templateMemoryMB(build.RamMb, build.MaxRamMb, build.StartMemoryMb),
 		DiskSizeMB:  sharedUtils.CastPtr(build.TotalDiskSizeMb, func(v int64) api.DiskSizeMB { return api.DiskSizeMB(v) }),
 		EnvdVersion: build.EnvdVersion,
 	}

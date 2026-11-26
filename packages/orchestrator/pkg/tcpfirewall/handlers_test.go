@@ -8,6 +8,9 @@ import (
 	"syscall"
 	"testing"
 
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+
 	"github.com/e2b-dev/infra/packages/orchestrator/pkg/sandbox"
 	"github.com/e2b-dev/infra/packages/shared/pkg/grpc/orchestrator"
 	sandbox_network "github.com/e2b-dev/infra/packages/shared/pkg/sandbox-network"
@@ -124,9 +127,7 @@ func TestMatchDomain(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
 			got := matchDomain(tt.hostname, tt.pattern)
-			if got != tt.want {
-				t.Errorf("matchDomain(%q, %q) = %v, want %v", tt.hostname, tt.pattern, got, tt.want)
-			}
+			assert.Equal(t, tt.want, got, "matchDomain(%q, %q)", tt.hostname, tt.pattern)
 		})
 	}
 }
@@ -395,22 +396,14 @@ func TestIsEgressAllowed(t *testing.T) {
 			got, _, err := isEgressAllowed(sbx, tt.hostname, tt.ip)
 
 			if tt.wantError {
-				if err == nil {
-					t.Errorf("isEgressAllowed() expected error, got nil")
-				}
+				assert.Error(t, err)
 
 				return
 			}
 
-			if err != nil {
-				t.Errorf("isEgressAllowed() unexpected error: %v", err)
+			require.NoError(t, err)
 
-				return
-			}
-
-			if got != tt.want {
-				t.Errorf("isEgressAllowed() = %v, want %v", got, tt.want)
-			}
+			assert.Equal(t, tt.want, got)
 		})
 	}
 }
@@ -430,6 +423,7 @@ func TestAlwaysDeniedCIDRs(t *testing.T) {
 		{"172.31.255.255 is denied", "172.31.255.255", true},
 		{"169.254.1.1 is denied (link-local)", "169.254.1.1", true},
 		{"127.0.0.1 is denied (loopback)", "127.0.0.1", true},
+		{"168.63.129.16 is denied (Azure host endpoint)", "168.63.129.16", true},
 
 		// IPs NOT in denied CIDRs (public IPs)
 		{"8.8.8.8 is allowed (Google DNS)", "8.8.8.8", false},
@@ -447,20 +441,18 @@ func TestAlwaysDeniedCIDRs(t *testing.T) {
 		// Edge cases around CIDR boundaries
 		{"172.15.255.255 is allowed (just before 172.16.0.0/12)", "172.15.255.255", false},
 		{"172.32.0.0 is allowed (just after 172.16.0.0/12)", "172.32.0.0", false},
+		{"168.63.129.15 is allowed (just before 168.63.129.16/32)", "168.63.129.15", false},
+		{"168.63.129.17 is allowed (just after 168.63.129.16/32)", "168.63.129.17", false},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
 			ip := net.ParseIP(tt.ip)
-			if ip == nil {
-				t.Fatalf("Failed to parse IP: %s", tt.ip)
-			}
+			require.NotNil(t, ip, "parse IP %s", tt.ip)
 
 			got := isIPInAlwaysDeniedCIDRs(ip)
-			if got != tt.want {
-				t.Errorf("isIPInDeniedCIDRs(%s) = %v, want %v", tt.ip, got, tt.want)
-			}
+			assert.Equal(t, tt.want, got)
 		})
 	}
 }
@@ -470,9 +462,7 @@ func TestMarkDSCP_SetsSocketTOS(t *testing.T) {
 	t.Parallel()
 
 	ln, err := (&net.ListenConfig{}).Listen(t.Context(), "tcp4", "127.0.0.1:0")
-	if err != nil {
-		t.Fatalf("listen: %v", err)
-	}
+	require.NoError(t, err)
 	t.Cleanup(func() { _ = ln.Close() })
 
 	go func() {
@@ -494,30 +484,21 @@ func TestMarkDSCP_SetsSocketTOS(t *testing.T) {
 			}
 
 			conn, err := dialer.DialContext(t.Context(), "tcp4", ln.Addr().String())
-			if err != nil {
-				t.Fatalf("dial: %v", err)
-			}
+			require.NoError(t, err)
 			t.Cleanup(func() { _ = conn.Close() })
 
 			raw, err := conn.(*net.TCPConn).SyscallConn()
-			if err != nil {
-				t.Fatalf("syscall conn: %v", err)
-			}
+			require.NoError(t, err)
 
 			var got int
 			var sockErr error
-			if err := raw.Control(func(fd uintptr) {
+			err = raw.Control(func(fd uintptr) {
 				got, sockErr = syscall.GetsockoptInt(int(fd), syscall.IPPROTO_IP, syscall.IP_TOS)
-			}); err != nil {
-				t.Fatalf("control: %v", err)
-			}
-			if sockErr != nil {
-				t.Fatalf("getsockopt IP_TOS: %v", sockErr)
-			}
+			})
+			require.NoError(t, err)
+			require.NoError(t, sockErr, "getsockopt IP_TOS")
 
-			if got != tos {
-				t.Errorf("IP_TOS = %#x, want %#x", got, tos)
-			}
+			assert.Equal(t, tos, got, "IP_TOS")
 		})
 	}
 }

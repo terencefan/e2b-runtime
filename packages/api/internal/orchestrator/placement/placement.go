@@ -3,9 +3,12 @@ package placement
 import (
 	"context"
 	"maps"
+	"regexp"
 	"time"
 
 	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/metric"
 	"go.uber.org/zap"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
@@ -19,6 +22,11 @@ import (
 )
 
 var tracer = otel.Tracer("github.com/e2b-dev/infra/packages/api/internal/orchestrator/placement")
+
+var createRefusals = sharedutils.Must(telemetry.GetCounter(otel.Meter("github.com/e2b-dev/infra/packages/api/internal/orchestrator/placement"), telemetry.ApiOrchestratorCreateRefusals))
+
+// The node reports a guest memory mapping refusal without a typed detail.
+var guestMemoryPoolRefusal = regexp.MustCompile(`^this node cannot map [0-9]+ MiB of guest memory: its memory pool is too small or in use by running sandboxes$`)
 
 // PlacementResult carries the outcome of a placement attempt alongside the error.
 type PlacementResult struct {
@@ -44,6 +52,11 @@ type Requirements struct {
 	CPU      CPURequirement
 	Features FeatureRequirement
 	Memory   MemoryRequirement
+	// MemoryMiB is the most memory the sandbox may run with when the request
+	// does not carry its size: a start from a build with a memory maximum whose
+	// size the API does not know is accounted at the maximum. The larger of it
+	// and the request's sizes is accounted.
+	MemoryMiB int64
 }
 
 // Algorithm defines the interface for sandbox placement strategies.
@@ -122,7 +135,7 @@ func placeSandbox(
 
 	resources := nodemanager.SandboxResources{
 		CPUs:      sbxRequest.GetSandbox().GetVcpu(),
-		MiBMemory: sbxRequest.GetSandbox().GetRamMb(),
+		MiBMemory: max(sbxRequest.GetSandbox().GetRamMb(), sbxRequest.GetSandbox().GetMemoryMb(), requirements.MemoryMiB),
 		HugePages: true,
 	}
 
@@ -292,6 +305,10 @@ func placeSandbox(
 			statusCode = st.Code()
 		}
 
+		if statusCode == codes.FailedPrecondition && failedNode.IsClusterNode() && guestMemoryPoolRefusal.MatchString(st.Message()) {
+			failedNode.RecordHugePageRefusal()
+		}
+
 		// Remember the first node that got far enough to actually attempt the
 		// sandbox (i.e. did not refuse with ResourceExhausted).
 		if statusCode != codes.ResourceExhausted && firstTriedNode == nil {
@@ -302,9 +319,12 @@ func placeSandbox(
 		case codes.ResourceExhausted:
 			refusals++
 			failedNode.PlacementMetrics.Skip(sbxRequest.GetSandbox().GetSandboxId())
+			cause := "capacity"
 			if ok && createRefusedByStatus(st) {
+				cause = "status"
 				skipped[failedNode.ID] = struct{}{}
 			}
+			createRefusals.Add(ctx, 1, metric.WithAttributes(attribute.String("cause", cause)))
 
 			delay := backoff.delay(refusals)
 			logger.L().Warn(ctx, "Node exhausted, trying another node", logger.WithSandboxID(sbxRequest.GetSandbox().GetSandboxId()), logger.WithNodeID(failedNode.ID), zap.Int("refusals", refusals), zap.Duration("retry_in", delay), zap.Error(utils.UnwrapGRPCError(err)))

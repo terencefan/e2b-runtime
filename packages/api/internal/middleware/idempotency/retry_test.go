@@ -18,9 +18,9 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	dbtypes "github.com/e2b-dev/infra/packages/api/internal/db/pkg/types"
 	"github.com/e2b-dev/infra/packages/auth/pkg/auth"
 	"github.com/e2b-dev/infra/packages/auth/pkg/types"
-	dbtypes "github.com/e2b-dev/infra/packages/db/pkg/types"
 	"github.com/e2b-dev/infra/packages/shared/pkg/apierrors"
 	"github.com/e2b-dev/infra/packages/shared/pkg/featureflags"
 	sharedmiddleware "github.com/e2b-dev/infra/packages/shared/pkg/middleware"
@@ -170,7 +170,7 @@ func TestConcurrentRetryableOperation(t *testing.T) {
 	select {
 	case <-started:
 	case <-done:
-		t.Fatalf("retry did not execute: %s", (<-owner).Body.String())
+		require.Failf(t, "retry did not execute", "%s", (<-owner).Body.String())
 	}
 	var wg sync.WaitGroup
 	responses := make([]*httptest.ResponseRecorder, 16)

@@ -31,6 +31,7 @@ import (
 
 	"github.com/e2b-dev/infra/packages/api/internal/api"
 	"github.com/e2b-dev/infra/packages/api/internal/cfg"
+	sqlcdb "github.com/e2b-dev/infra/packages/api/internal/db/client"
 	"github.com/e2b-dev/infra/packages/api/internal/handlers"
 	customMiddleware "github.com/e2b-dev/infra/packages/api/internal/middleware"
 	"github.com/e2b-dev/infra/packages/api/internal/middleware/idempotency"
@@ -38,7 +39,6 @@ import (
 	"github.com/e2b-dev/infra/packages/api/internal/oauth"
 	"github.com/e2b-dev/infra/packages/api/internal/utils"
 	"github.com/e2b-dev/infra/packages/auth/pkg/auth"
-	sqlcdb "github.com/e2b-dev/infra/packages/db/client"
 	"github.com/e2b-dev/infra/packages/shared/pkg/apierrors"
 	"github.com/e2b-dev/infra/packages/shared/pkg/env"
 	"github.com/e2b-dev/infra/packages/shared/pkg/factories"
@@ -241,6 +241,9 @@ func NewGinServer(ctx context.Context, config cfg.Config, tel *telemetry.Client,
 	// EnforceBlockedTeam. Must run after auth (which populates team info on
 	// the gin context) and before the handlers.
 	r.Use(customMiddleware.EnforceBlockedTeam())
+	// Deny a read-only member every route that changes something. Same
+	// ordering constraint as above.
+	r.Use(customMiddleware.EnforceReadOnlyMember())
 	r.Use(idempotency.Middleware(redisClient, ff)) //nolint:contextcheck // Gin middleware gets context from the request.
 
 	// We now register our store above as the handler for the interface
@@ -368,12 +371,24 @@ func run() int {
 	}
 
 	var cleanupFns []func(context.Context) error
+	// closeRedis runs after every cleanup function has returned: they still
+	// use Redis while they stop.
+	var closeRedis func() error
 	exitCode := &atomic.Int32{}
 	cleanupOp := func() {
 		// some cleanup functions do work that requires a context. passing shutdown a
 		// specific context here so that all timeout configuration is in one place.
 		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 		defer cancel()
+		defer func() {
+			if closeRedis == nil {
+				return
+			}
+			if err := closeRedis(); err != nil {
+				exitCode.Add(1)
+				l.Error(ctx, "Closing the Redis client failed", zap.Error(err))
+			}
+		}()
 
 		start := time.Now()
 		// doing shutdown in parallel to avoid
@@ -423,9 +438,7 @@ func run() int {
 	if err != nil {
 		logger.L().Fatal(ctx, "Initializing Redis client", zap.Error(err))
 	}
-	cleanupFns = append(cleanupFns, func(_ context.Context) error {
-		return redisClient.Close()
-	})
+	closeRedis = redisClient.Close
 
 	featureFlags, err := featureflags.NewClient(config.DeploymentEnvironment, serviceName, serviceVersion, featureflags.WithStartOnInitTimeout())
 	if err != nil {
@@ -437,9 +450,21 @@ func run() int {
 	if err != nil {
 		l.Fatal(ctx, "failed to set up mutual TLS", zap.Error(err))
 	}
-	tlsConfig, err := newServiceTLS(tlsProcess, config.TLS, config.AnalyticsCollectorHost != "" && !config.AnalyticsCollectorTLS, false)
+	tlsConfig, err := newServiceTLS(tlsProcess, config.TLS, config.AnalyticsCollectorHost != "" && !config.AnalyticsCollectorTLS)
 	if err != nil {
 		l.Fatal(ctx, "invalid mutual TLS configuration", zap.Error(err))
+	}
+	if config.SchedulingAPIGrpcAddress != "" {
+		tlsConfig.hops.Scheduling, err = newSchedulingHop(tlsProcess, config.TLS.Scheduling)
+		if err != nil {
+			l.Fatal(ctx, "invalid mutual TLS configuration for the scheduling hop", zap.Error(err))
+		}
+	}
+	if config.ClusterServiceGrpcAddress != "" {
+		tlsConfig.hops.ClusterService, err = newClusterServiceHop(tlsProcess, config.TLS.ClusterService, config.ClusterServiceGrpcAddress, env.IsLocal())
+		if err != nil {
+			l.Fatal(ctx, "invalid mutual TLS configuration for the cluster service hop", zap.Error(err))
+		}
 	}
 
 	// External sandbox logger routes through LaunchDarkly (LogsWriteConfigFlag),
@@ -515,8 +540,17 @@ func run() int {
 	if err != nil {
 		l.Fatal(ctx, "failed to create client proxy OIDC verifier", zap.Error(err))
 	}
-	if !oauth.Configured(config.ClientProxyOIDCIssuerURL) {
-		l.Warn(ctx, "client proxy OIDC is not configured; edge proxy gRPC requests will be rejected")
+	if !oauth.Configured(config.ClientProxyOIDCIssuerURL) && config.ClusterServiceGrpcAddress == "" {
+		l.Warn(ctx, "client proxy authentication is not configured; edge proxy gRPC requests will be rejected")
+	}
+	if len(config.ResumeVerificationKMSVersions) > 0 || config.ResumeVerificationJWKS != "" {
+		clientProxyOAuthVerifier, err = handlers.NewRegionalResumeVerifier(ctx, config.ResumeVerificationKMSVersions, config.ResumeVerificationJWKS, clientProxyOAuthVerifier)
+		if err != nil {
+			l.Fatal(ctx, "invalid regional resume verification keys", zap.Error(err))
+		}
+		if err := apiStore.RegisterResumeExchange(edgeGrpcServer); err != nil {
+			l.Fatal(ctx, "configure regional resume exchange", zap.Error(err))
+		}
 	}
 	proxygrpc.RegisterSandboxServiceServer(edgeGrpcServer, handlers.NewSandboxService(apiStore, true, clientProxyOAuthVerifier))
 

@@ -11,11 +11,11 @@ import (
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 
+	"github.com/e2b-dev/infra/packages/api/internal/db/pkg/types"
+	"github.com/e2b-dev/infra/packages/api/internal/db/queries"
 	"github.com/e2b-dev/infra/packages/api/internal/orchestrator/nodemanager"
 	"github.com/e2b-dev/infra/packages/api/internal/pause"
 	"github.com/e2b-dev/infra/packages/api/internal/sandbox"
-	"github.com/e2b-dev/infra/packages/db/pkg/types"
-	"github.com/e2b-dev/infra/packages/db/queries"
 	"github.com/e2b-dev/infra/packages/shared/pkg/consts"
 	"github.com/e2b-dev/infra/packages/shared/pkg/grpc/orchestrator"
 	"github.com/e2b-dev/infra/packages/shared/pkg/id"
@@ -208,6 +208,8 @@ func buildUpsertSnapshotParams(sbx sandbox.Sandbox, node *nodemanager.Node, curr
 		clusterID = &sbx.ClusterID
 	}
 
+	pausedTTL := pausedTTLSeconds(sbx.PausedTTL)
+
 	return queries.UpsertSnapshotParams{
 		// Used if there's no snapshot for this sandbox yet
 		TemplateID:     id.Generate(),
@@ -236,6 +238,7 @@ func buildUpsertSnapshotParams(sbx sandbox.Sandbox, node *nodemanager.Node, curr
 			FilesystemOnly:          currentKind,
 			AutoPauseFilesystemOnly: sbx.AutoPauseFilesystemOnly,
 			Iam:                     sbx.Iam,
+			PausedTTL:               pausedTTL,
 		},
 		OriginNodeID: node.ID,
 		StatusGroup:  types.BuildStatusGroupInProgress,
@@ -243,7 +246,21 @@ func buildUpsertSnapshotParams(sbx sandbox.Sandbox, node *nodemanager.Node, curr
 		// node, so a pause/resume across CPU generations stays compatible.
 		SourceBuildID:       sbx.BuildID,
 		BuildFilesystemOnly: filesystemOnly,
+		StartMemoryMb:       snapshotStartMemoryMB(sbx),
 	}
+}
+
+// snapshotStartMemoryMB is the size a snapshot build records for its starts: the
+// memory the sandbox ran with, when its record knows it. It lives on the new
+// build, so it becomes the sandbox's size only when that build is ready; a pause
+// that fails leaves the size of the last ready build in force.
+func snapshotStartMemoryMB(sbx sandbox.Sandbox) *int64 {
+	if sbx.MemoryMB <= 0 {
+		return nil
+	}
+	memoryMB := sbx.MemoryMB
+
+	return &memoryMB
 }
 
 // throttledUpsertSnapshot runs UpsertSnapshot gated by the snapshot upsert semaphore.
@@ -253,5 +270,13 @@ func (o *Orchestrator) throttledUpsertSnapshot(ctx context.Context, params queri
 	}
 	defer o.snapshotUpsertSem.Release(1)
 
-	return o.sqlcDB.UpsertSnapshot(ctx, params)
+	row, err := o.sqlcDB.UpsertSnapshot(ctx, params)
+	if err == nil && row.MaxRamMb != nil && params.StartMemoryMb == nil {
+		reportMemorySizeUnknown(ctx, "pause", params.RamMb, *row.MaxRamMb,
+			logger.WithSandboxID(params.SandboxID),
+			logger.WithBuildID(row.BuildID.String()),
+		)
+	}
+
+	return row, err
 }

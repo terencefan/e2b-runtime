@@ -38,7 +38,6 @@ func endedServerSandbox(config *orchestrator.SandboxConfig) *sandbox.Sandbox {
 		},
 	}
 	sbx.SetStartedAt(startTime)
-	sbx.SetEndAt(endTime)
 
 	return sbx
 }
@@ -53,16 +52,18 @@ func TestListAndDeleteEndedSandbox(t *testing.T) {
 		sandboxFactory: &sandbox.Factory{Sandboxes: sandboxes},
 		info:           &service.ServiceInfo{},
 	}
-	sandboxes.AddEnded(endedServerSandbox(&orchestrator.SandboxConfig{TemplateId: "template-id"}), fc.GuestEventCrashNoRestart, time.Now())
+	ended := endedServerSandbox(&orchestrator.SandboxConfig{TemplateId: "template-id"})
+	ended.SetMemoryHotplugRequestedMBForTest(1024)
+	sandboxes.AddEnded(ended, fc.GuestEventCrashNoRestart, time.Now())
 
 	want := &orchestrator.RunningSandbox{
 		StartTime:   timestamppb.New(startTime),
-		EndTime:     timestamppb.New(endTime),
 		SandboxId:   listSandboxID,
 		TeamId:      listTeamID,
 		ExecutionId: listExecutionID,
 		Vcpu:        2,
 		RamMb:       512,
+		MemoryMb:    proto.Int64(1536),
 		Ended:       true,
 		GuestEvent:  orchestrator.GuestEvent_GUEST_EVENT_CRASH_NO_RESTART,
 	}

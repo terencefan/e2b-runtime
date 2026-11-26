@@ -18,13 +18,13 @@ import (
 	"github.com/e2b-dev/infra/packages/api/internal/api"
 	templatecache "github.com/e2b-dev/infra/packages/api/internal/cache/templates"
 	"github.com/e2b-dev/infra/packages/api/internal/clusters"
+	"github.com/e2b-dev/infra/packages/api/internal/db/pkg/testutils"
+	dbtypes "github.com/e2b-dev/infra/packages/api/internal/db/pkg/types"
+	"github.com/e2b-dev/infra/packages/api/internal/db/queries"
 	templateregistration "github.com/e2b-dev/infra/packages/api/internal/template"
 	templatemanager "github.com/e2b-dev/infra/packages/api/internal/template-manager"
 	"github.com/e2b-dev/infra/packages/auth/pkg/auth"
 	"github.com/e2b-dev/infra/packages/auth/pkg/types"
-	"github.com/e2b-dev/infra/packages/db/pkg/testutils"
-	dbtypes "github.com/e2b-dev/infra/packages/db/pkg/types"
-	"github.com/e2b-dev/infra/packages/db/queries"
 	sharedclusters "github.com/e2b-dev/infra/packages/shared/pkg/clusters"
 	"github.com/e2b-dev/infra/packages/shared/pkg/consts"
 	"github.com/e2b-dev/infra/packages/shared/pkg/featureflags"
@@ -75,11 +75,6 @@ func templateClusterTeam(t *testing.T, db *testutils.Database, clusterID *uuid.U
 
 func assignTemplateClusterTeam(t *testing.T, db *testutils.Database, team *types.Team, clusterID *uuid.UUID) {
 	t.Helper()
-	if clusterID != nil {
-		require.NoError(t, db.SqlcClient.TestsRawSQL(t.Context(),
-			`INSERT INTO public.clusters (id, name, endpoint, endpoint_tls, token)
-			 VALUES ($1::uuid, $1::uuid::text, $1::uuid::text, true, 'test-token') ON CONFLICT (id) DO NOTHING`, clusterID))
-	}
 	require.NoError(t, db.SqlcClient.TestsRawSQL(t.Context(), `UPDATE public.teams SET cluster_id = $2 WHERE id = $1`, team.ID, clusterID))
 	team.ClusterID = clusterID
 }

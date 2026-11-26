@@ -66,7 +66,7 @@ func (o *Orchestrator) analyticsRemove(ctx context.Context, sandbox sandbox.Sand
 		Timestamp:     timestamppb.New(stopTime),
 		Duration:      float32(duration),
 		CpuCount:      sandbox.VCpu,
-		RamMb:         sandbox.RamMB,
+		RamMb:         sandbox.TotalMemoryMB(),
 		DiskSizeMb:    sandbox.TotalDiskSizeMB,
 	})
 	if err != nil {
@@ -85,7 +85,7 @@ func (o *Orchestrator) analyticsInsert(ctx context.Context, sandbox sandbox.Sand
 		BuildId:       sandbox.BuildID.String(),
 		TeamId:        sandbox.TeamID.String(),
 		CpuCount:      sandbox.VCpu,
-		RamMb:         sandbox.RamMB,
+		RamMb:         sandbox.TotalMemoryMB(),
 		DiskSizeMb:    sandbox.TotalDiskSizeMB,
 		Timestamp:     timestamppb.Now(),
 	})
@@ -121,7 +121,7 @@ func createdInstanceProperties(properties posthog.Properties, sbx sandbox.Sandbo
 		Set("kernel_version", sbx.KernelVersion).
 		Set("node_id", sbx.NodeID).
 		Set("vcpu", sbx.VCpu).
-		Set("ram_mb", sbx.RamMB).
+		Set("ram_mb", sbx.TotalMemoryMB()).
 		Set("total_disk_size_mb", sbx.TotalDiskSizeMB).
 		Set("auto_pause", sbx.AutoPause).
 		Set("egress_proxy", sbx.Network.HasEgressProxy())
@@ -194,6 +194,6 @@ func (o *Orchestrator) handleNewlyCreatedSandbox(ctx context.Context, sbx sandbo
 	o.analyticsInsert(ctx, sbx)
 	o.emitCreatedInstancePosthog(ctx, sbx, meta, startDuration)
 	o.teamMetricsObserver.Add(ctx, sbx.TeamID)
-	o.createdCounter.Add(ctx, 1, metric.WithAttributes(telemetry.WithTeamID(sbx.TeamID.String())))
+	o.createdCounter.Add(ctx, 1, metric.WithAttributes(telemetry.WithTeamID(sbx.TeamID.String())), withCluster(sbx.ClusterID))
 	logSandboxCreated(ctx, sbx)
 }

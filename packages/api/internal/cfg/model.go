@@ -137,7 +137,9 @@ type Config struct {
 	APIInternalGrpcPort uint16 `env:"API_INTERNAL_GRPC_PORT" envDefault:"5009"`
 	APIEdgeGrpcPort     uint16 `env:"API_EDGE_GRPC_PORT"     envDefault:"5109"`
 
-	ClientProxyOIDCIssuerURL string `env:"CLIENT_PROXY_OIDC_ISSUER_URL"`
+	ResumeVerificationKMSVersions []string `env:"RESUME_SIGNING_KMS_VERSION"   envSeparator:","`
+	ResumeVerificationJWKS        string   `env:"RESUME_VERIFICATION_JWKS"`
+	ClientProxyOIDCIssuerURL      string   `env:"CLIENT_PROXY_OIDC_ISSUER_URL"`
 
 	SandboxAccessTokenHashSeed string `env:"SANDBOX_ACCESS_TOKEN_HASH_SEED"`
 
@@ -152,6 +154,19 @@ type Config struct {
 	// backend. Unset leaves those routes registered and answering as they do
 	// when the backend is absent, so the surface does not depend on the wiring.
 	WebhooksBackendGrpcAddress string `env:"WEBHOOKS_BACKEND_GRPC_ADDRESS"`
+
+	// ClusterServiceGrpcAddress is the gRPC target of the cluster service,
+	// which stores the remote clusters. Optional: when empty the API runs on
+	// the local cluster alone and answers the cluster admin and management
+	// routes with 503, and refuses to start while a team is assigned to a
+	// remote cluster.
+	ClusterServiceGrpcAddress string `env:"CLUSTER_SERVICE_GRPC_ADDRESS"`
+
+	// SchedulingAPIGrpcAddress is the gRPC target of scheduling-api, either
+	// "host:port" or a schemed target such as "dns:///name:port" for a
+	// headless Service, so that every replica gets its own connection.
+	// Optional: when empty the API makes no connection to it.
+	SchedulingAPIGrpcAddress string `env:"SCHEDULING_API_GRPC_ADDRESS"`
 
 	VolumesToken VolumesTokenConfig
 
@@ -183,8 +198,7 @@ type Config struct {
 	// Self-hosted deployments whose teams start each other's templates set it true.
 	TemplatesDefaultPublic bool `env:"TEMPLATES_DEFAULT_PUBLIC"`
 
-	// OutboxMaxWorkers is how many River outbox jobs one API replica works at
-	// once.
+	// OutboxMaxWorkers limits concurrent jobs on the default queue per replica.
 	OutboxMaxWorkers int `env:"OUTBOX_MAX_WORKERS" envDefault:"10"`
 	// OutboxBacklogInterval is how often the outbox backlog gauges are read
 	// from the database.

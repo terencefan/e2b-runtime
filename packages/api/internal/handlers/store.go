@@ -23,11 +23,14 @@ import (
 
 	analyticscollector "github.com/e2b-dev/infra/packages/api/internal/analytics_collector"
 	"github.com/e2b-dev/infra/packages/api/internal/api"
+	"github.com/e2b-dev/infra/packages/api/internal/authservice"
 	sandboxcountscache "github.com/e2b-dev/infra/packages/api/internal/cache/sandboxcounts"
 	snapshotcache "github.com/e2b-dev/infra/packages/api/internal/cache/snapshots"
 	templatecache "github.com/e2b-dev/infra/packages/api/internal/cache/templates"
 	"github.com/e2b-dev/infra/packages/api/internal/cfg"
 	"github.com/e2b-dev/infra/packages/api/internal/clusters"
+	sqlcdb "github.com/e2b-dev/infra/packages/api/internal/db/client"
+	authdb "github.com/e2b-dev/infra/packages/api/internal/db/pkg/auth"
 	"github.com/e2b-dev/infra/packages/api/internal/management"
 	"github.com/e2b-dev/infra/packages/api/internal/orchestrator"
 	"github.com/e2b-dev/infra/packages/api/internal/outbox"
@@ -40,14 +43,11 @@ import (
 	"github.com/e2b-dev/infra/packages/auth/pkg/types"
 	clickhouse "github.com/e2b-dev/infra/packages/clickhouse/pkg"
 	"github.com/e2b-dev/infra/packages/clickhouse/pkg/sandboxlogs"
-	sqlcdb "github.com/e2b-dev/infra/packages/db/client"
-	authdb "github.com/e2b-dev/infra/packages/db/pkg/auth"
-	"github.com/e2b-dev/infra/packages/db/pkg/dberrors"
-	"github.com/e2b-dev/infra/packages/db/pkg/pool"
 	"github.com/e2b-dev/infra/packages/shared/pkg/apierrors"
 	sharedclusters "github.com/e2b-dev/infra/packages/shared/pkg/clusters/discovery"
 	"github.com/e2b-dev/infra/packages/shared/pkg/env"
 	"github.com/e2b-dev/infra/packages/shared/pkg/featureflags"
+	clustersgrpc "github.com/e2b-dev/infra/packages/shared/pkg/grpc/contracts/clusters/management"
 	placementpb "github.com/e2b-dev/infra/packages/shared/pkg/grpc/contracts/sandbox/placement"
 	managementv1 "github.com/e2b-dev/infra/packages/shared/pkg/grpc/contracts/secretsstore/management"
 	webhookevents "github.com/e2b-dev/infra/packages/shared/pkg/grpc/contracts/webhooks/events"
@@ -55,6 +55,8 @@ import (
 	"github.com/e2b-dev/infra/packages/shared/pkg/logger"
 	"github.com/e2b-dev/infra/packages/shared/pkg/logs/loki"
 	"github.com/e2b-dev/infra/packages/shared/pkg/mtls"
+	"github.com/e2b-dev/infra/packages/shared/pkg/postgres/dberrors"
+	"github.com/e2b-dev/infra/packages/shared/pkg/postgres/pool"
 	"github.com/e2b-dev/infra/packages/shared/pkg/servicediscovery"
 	"github.com/e2b-dev/infra/packages/shared/pkg/servicediscovery/kube"
 	"github.com/e2b-dev/infra/packages/shared/pkg/servicediscovery/nomad"
@@ -218,6 +220,7 @@ type APIStore struct {
 	pauseLimiter           *pauselimit.Limiter
 	resumeBackendOverride  resumeWaitOrchestrator
 	connectBackendOverride connectOrchestrator
+	createBackendOverride  sandboxCreator
 	// snapshotBackendOverride does the same for the snapshot-template
 	// handler: the memory:false refusals must land before the sandbox leaves
 	// Running.
@@ -235,7 +238,7 @@ type APIStore struct {
 	templateCache             *templatecache.TemplateCache
 	templateBuildsCache       *templatecache.TemplatesBuildCache
 	snapshotCache             *snapshotcache.SnapshotCache
-	authService               sharedauth.Service
+	authService               authservice.Service
 	managementService         *management.Service
 	teamService               *team.Service
 	riverClient               *river.Client[pgx.Tx] // set by NewOutbox
@@ -261,6 +264,12 @@ type APIStore struct {
 	webhooksConn      *grpc.ClientConn
 	webhookManagement webhookmanagement.WebhookManagementServiceClient
 	sandboxEvents     webhookevents.SandboxEventsServiceClient
+
+	// clusterService is nil when no cluster service address is configured.
+	clusterServiceConn *grpc.ClientConn
+	clusterService     clustersgrpc.ClusterServiceClient
+
+	schedulingConn *grpc.ClientConn
 }
 
 const (
@@ -346,7 +355,7 @@ func NewAPIStore(ctx context.Context, tel *telemetry.Client, redisClient redis.U
 		clusterLogsReader = sandboxLogsReader
 	}
 
-	posthogClient, posthogErr := analyticscollector.NewPosthogClient(ctx, config.PosthogAPIKey)
+	posthogClient, posthogErr := analyticscollector.NewPosthogClient(ctx, config.PosthogAPIKey, analyticscollector.WithCluster(config.DeploymentEnvironment))
 	if posthogErr != nil {
 		logger.L().Fatal(ctx, "Initializing Posthog client", zap.Error(posthogErr))
 	}
@@ -372,7 +381,27 @@ func NewAPIStore(ctx context.Context, tel *telemetry.Client, redisClient redis.U
 		}
 	}
 
-	clusters, err := clusters.NewPool(ctx, tel, sqlcDB, sd.templateBuilders, clickhouseStore, queryLogsProvider, clusterLogsReader, featureFlags, config, hops.Orchestrator)
+	// An unset address leaves the local cluster as the only one, and the
+	// cluster admin and management routes answering 503.
+	var (
+		clusterServiceConn *grpc.ClientConn
+		clusterService     clustersgrpc.ClusterServiceClient
+	)
+	if config.ClusterServiceGrpcAddress != "" {
+		clusterServiceConn, err = newReadinessBalancedClient(config.ClusterServiceGrpcAddress, hops.ClusterService, clustersgrpc.ClusterService_ServiceDesc.ServiceName, "cluster service")
+		if err != nil {
+			logger.L().Fatal(ctx, "Initializing cluster service client", zap.Error(err))
+		}
+
+		clusterService = clustersgrpc.NewClusterServiceClient(clusterServiceConn)
+	} else {
+		if err := refuseLocalOnlyWithRemoteClusters(ctx, sqlcDB); err != nil {
+			logger.L().Fatal(ctx, "CLUSTER_SERVICE_GRPC_ADDRESS is required", zap.Error(err))
+		}
+		logger.L().Warn(ctx, "CLUSTER_SERVICE_GRPC_ADDRESS is not set: only the local cluster is available")
+	}
+
+	clusters, err := clusters.NewPool(ctx, tel, sqlcDB, clusterService, sd.templateBuilders, clickhouseStore, queryLogsProvider, clusterLogsReader, featureFlags, config, hops.Orchestrator)
 	if err != nil {
 		logger.L().Fatal(ctx, "initializing edge clusters pool failed", zap.Error(err))
 	}
@@ -399,7 +428,15 @@ func NewAPIStore(ctx context.Context, tel *telemetry.Client, redisClient redis.U
 		logger.L().Fatal(ctx, "failed to create snapshot build query semaphore", zap.Error(err))
 	}
 
-	orch, err := orchestrator.New(ctx, config, tel, sd.nodes, provider == cfg.ServiceDiscoveryProviderLocal, posthogClient, redisClient, sqlcDB, clusters, featureFlags, accessTokenGenerator, snapshotCache, snapshotUpsertSem, hops.Analytics, hops.Orchestrator)
+	var schedulingConn *grpc.ClientConn
+	if config.SchedulingAPIGrpcAddress != "" {
+		schedulingConn, err = newSchedulingClient(config.SchedulingAPIGrpcAddress, hops.Scheduling)
+		if err != nil {
+			logger.L().Fatal(ctx, "Initializing scheduling-api client", zap.Error(err))
+		}
+	}
+
+	orch, err := orchestrator.New(ctx, config, tel, sd.nodes, provider == cfg.ServiceDiscoveryProviderLocal, posthogClient, redisClient, sqlcDB, clusters, featureFlags, accessTokenGenerator, snapshotCache, snapshotUpsertSem, hops.Analytics, hops.Orchestrator, schedulingConn)
 	if err != nil {
 		logger.L().Fatal(ctx, "Initializing Orchestrator client", zap.Error(err))
 	}
@@ -416,7 +453,7 @@ func NewAPIStore(ctx context.Context, tel *telemetry.Client, redisClient redis.U
 	authClient := &http.Client{
 		Transport: otelhttp.NewTransport(http.DefaultTransport),
 	}
-	authService, err := sharedauth.NewAuthService(ctx, redisClient, authDB, config.AuthProvider, authClient)
+	authService, err := authservice.NewAuthService(ctx, redisClient, authDB, config.AuthProvider, authClient)
 	if err != nil {
 		logger.L().Fatal(ctx, "Initializing auth service", zap.Error(err))
 	}
@@ -478,7 +515,7 @@ func NewAPIStore(ctx context.Context, tel *telemetry.Client, redisClient redis.U
 		templateBuildsCache:   templateBuildsCache,
 		snapshotCache:         snapshotCache,
 		authService:           authService,
-		managementService:     management.NewService(authDB, sqlcDB, authService, tel.MeterProvider),
+		managementService:     management.NewService(authDB, sqlcDB, authService, clusterService, tel.MeterProvider),
 		teamService:           team.NewService(sqlcDB, authService, orch, templateManager, banRequestBudget),
 		templateSpawnCounter:  templateSpawnCounter,
 		clickhouseStore:       clickhouseStore,
@@ -496,6 +533,9 @@ func NewAPIStore(ctx context.Context, tel *telemetry.Client, redisClient redis.U
 		webhookManagement:     webhookManagement,
 		sandboxEvents:         sandboxEvents,
 		secretsManagement:     secretsManagement,
+		clusterServiceConn:    clusterServiceConn,
+		clusterService:        clusterService,
+		schedulingConn:        schedulingConn,
 	}
 
 	go a.updateDBThrottleLimits(ctx)
@@ -521,6 +561,7 @@ func NewAPIStore(ctx context.Context, tel *telemetry.Client, redisClient redis.U
 func (a *APIStore) NewOutbox(l logger.Logger) (*outbox.River, error) {
 	riverOutbox, err := outbox.New(outbox.Dependencies{
 		Pool:        a.sqlcDB.Pool(),
+		Webhooks:    a.webhookManagement,
 		Sandboxes:   a.orchestrator,
 		Containment: a.teamService,
 		TeamCache:   a.authService,
@@ -621,6 +662,18 @@ func (a *APIStore) Close(ctx context.Context) error {
 	if a.webhooksConn != nil {
 		if err := a.webhooksConn.Close(); err != nil {
 			errs = append(errs, fmt.Errorf("closing webhooks backend client: %w", err))
+		}
+	}
+
+	if a.clusterServiceConn != nil {
+		if err := a.clusterServiceConn.Close(); err != nil {
+			errs = append(errs, fmt.Errorf("closing cluster service client: %w", err))
+		}
+	}
+
+	if a.schedulingConn != nil {
+		if err := a.schedulingConn.Close(); err != nil {
+			errs = append(errs, fmt.Errorf("closing scheduling-api client: %w", err))
 		}
 	}
 
@@ -749,5 +802,5 @@ func (a *APIStore) GetTeamFromAdminToken(ctx context.Context, _ *gin.Context, te
 }
 
 func (a *APIStore) SandboxPlacementService(callers *mtls.AllowList) placementpb.SandboxPlacementServiceServer {
-	return orchestrator.NewSandboxPlacementService(a.orchestrator, callers)
+	return orchestrator.NewSandboxPlacementService(a.orchestrator, callers, a.authService)
 }

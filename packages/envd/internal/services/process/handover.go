@@ -27,13 +27,16 @@ type HandoverResult struct {
 	RetainedFailed int
 	Watchers       int
 	WatchersFailed int
+	EnvVars        int
 	// Mounts and Forwards are decoded from the blob and handed back to their
 	// owners (the API service's mount ledger and the port forwarder), which are
 	// constructed after ResumeFromHandover runs — so unlike watchers they are
 	// returned rather than applied via a callback.
 	Mounts   []*upgrade.MountEntry
 	Forwards []*upgrade.ForwardedPort
-	Helpers  []int32
+	// LocalhostForwardingOff is nil unless a handover was decoded.
+	LocalhostForwardingOff *bool
+	Helpers                []int32
 }
 
 // ErrWorkloadNotFrozen means the pre-handover freeze was issued but the workload
@@ -106,4 +109,19 @@ func ApplyHandoverDefaults(st *upgrade.HandoverState, d *execcontext.Defaults) (
 	}
 
 	return user, workdir
+}
+
+// ApplyHandoverEnvVars restores the carried user environment variables onto the incoming
+// envd's defaults and reports how many it applied. A blob without them (an outgoing envd
+// predating the field, or a sandbox with none) leaves the store as it is. A later /init
+// carrying variables still replaces them.
+func ApplyHandoverEnvVars(st *upgrade.HandoverState, d *execcontext.Defaults) int {
+	vars := st.GetDefaults().GetEnvVars()
+	if len(vars) == 0 || d == nil || d.EnvVars == nil {
+		return 0
+	}
+	d.EnvVars.ReplaceUserVars(vars)
+
+	// Counted after the replace: a carried name envd already holds as its own is skipped.
+	return len(d.EnvVars.UserVars())
 }

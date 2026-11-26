@@ -21,15 +21,16 @@ import (
 	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/types/known/wrapperspb"
 
+	"github.com/e2b-dev/infra/packages/api/internal/authservice"
 	snapshotcache "github.com/e2b-dev/infra/packages/api/internal/cache/snapshots"
 	"github.com/e2b-dev/infra/packages/api/internal/clusters"
+	"github.com/e2b-dev/infra/packages/api/internal/db/pkg/testutils"
+	dbtypes "github.com/e2b-dev/infra/packages/api/internal/db/pkg/types"
+	"github.com/e2b-dev/infra/packages/api/internal/db/queries"
 	"github.com/e2b-dev/infra/packages/api/internal/oauth"
 	"github.com/e2b-dev/infra/packages/api/internal/sandbox"
 	sharedauth "github.com/e2b-dev/infra/packages/auth/pkg/auth"
 	authtypes "github.com/e2b-dev/infra/packages/auth/pkg/types"
-	"github.com/e2b-dev/infra/packages/db/pkg/testutils"
-	dbtypes "github.com/e2b-dev/infra/packages/db/pkg/types"
-	"github.com/e2b-dev/infra/packages/db/queries"
 	"github.com/e2b-dev/infra/packages/shared/pkg/grpc/orchestrator"
 	proxygrpc "github.com/e2b-dev/infra/packages/shared/pkg/grpc/proxy"
 	"github.com/e2b-dev/infra/packages/shared/pkg/id"
@@ -57,7 +58,7 @@ func (s *autoResumeBackendStub) HandleExistingSandboxAutoResume(context.Context,
 }
 
 type teamAuthServiceStub struct {
-	sharedauth.Service
+	authservice.Service
 
 	team *authtypes.Team
 	err  error
@@ -225,6 +226,7 @@ func TestResumeSandbox_EdgeCallerCredentialFailuresAreUnauthenticated(t *testing
 // resumeCase is one edge client-proxy's ResumeSandbox call against a seeded
 // sandbox.
 type resumeCase struct {
+	callerCluster string
 	callerOrg     string
 	policy        dbtypes.SandboxAutoResumePolicy
 	teamClusterID *uuid.UUID
@@ -254,7 +256,7 @@ func resumeWith(t *testing.T, pool *clusters.Pool, c resumeCase) resumeOutcome {
 		sandboxID = "i" + id.Generate()
 	}
 
-	svc := NewSandboxService(store, true, verifierStub{claims: oauth.Claims{OrgID: c.callerOrg, Scopes: []string{oauth.RequiredScope}}})
+	svc := NewSandboxService(store, true, verifierStub{claims: oauth.Claims{OrgID: c.callerOrg, ClusterID: c.callerCluster, Scopes: []string{oauth.RequiredScope}}})
 	ctx := metadata.NewIncomingContext(t.Context(), metadata.Pairs(proxygrpc.MetadataAuthorization, "Bearer token"))
 
 	_, err := svc.ResumeSandbox(ctx, &proxygrpc.SandboxResumeRequest{SandboxId: sandboxID})
@@ -299,6 +301,14 @@ func TestResumeSandbox_EdgeCallerSeesOnlyItsOrgsSandboxes(t *testing.T) {
 			assert.Equal(t, orgMismatch, resumeWith(t, pool, tt.c))
 		})
 	}
+
+	t.Run("a registered workload resumes only its assigned sandboxes", func(t *testing.T) {
+		t.Parallel()
+		c := resumeCase{callerCluster: clusterID.String(), policy: dbtypes.SandboxAutoResumeAny, teamClusterID: &clusterID}
+		assert.True(t, resumeWith(t, pool, c).routed)
+		c.callerCluster = uuid.NewString()
+		assert.Equal(t, orgMismatch, resumeWith(t, pool, c))
+	})
 
 	t.Run("the sandbox's own org routes it", func(t *testing.T) {
 		t.Parallel()
