@@ -13,21 +13,23 @@ import (
 	"go.opentelemetry.io/otel/metric"
 	"go.uber.org/zap"
 	"golang.org/x/sync/singleflight"
+	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials"
 
 	analyticscollector "github.com/e2b-dev/infra/packages/api/internal/analytics_collector"
 	"github.com/e2b-dev/infra/packages/api/internal/cfg"
 	"github.com/e2b-dev/infra/packages/api/internal/clusters"
+	sqlcdb "github.com/e2b-dev/infra/packages/api/internal/db/client"
 	"github.com/e2b-dev/infra/packages/api/internal/metrics"
 	"github.com/e2b-dev/infra/packages/api/internal/orchestrator/evictor"
 	"github.com/e2b-dev/infra/packages/api/internal/orchestrator/nodemanager"
 	"github.com/e2b-dev/infra/packages/api/internal/orchestrator/placement"
 	"github.com/e2b-dev/infra/packages/api/internal/sandbox"
-	redisreservations "github.com/e2b-dev/infra/packages/api/internal/sandbox/reservations/redis"
-	redisbackend "github.com/e2b-dev/infra/packages/api/internal/sandbox/storage/redis"
-	sqlcdb "github.com/e2b-dev/infra/packages/db/client"
 	"github.com/e2b-dev/infra/packages/shared/pkg/featureflags"
 	"github.com/e2b-dev/infra/packages/shared/pkg/logger"
+	"github.com/e2b-dev/infra/packages/shared/pkg/sandboxstore/remote"
+	redisreservations "github.com/e2b-dev/infra/packages/shared/pkg/sandboxstore/reservations/redis"
+	redisbackend "github.com/e2b-dev/infra/packages/shared/pkg/sandboxstore/storage/redis"
 	"github.com/e2b-dev/infra/packages/shared/pkg/servicediscovery"
 	"github.com/e2b-dev/infra/packages/shared/pkg/smap"
 	"github.com/e2b-dev/infra/packages/shared/pkg/telemetry"
@@ -71,21 +73,39 @@ type Orchestrator struct {
 	metricsRegistration           metric.Registration
 	sandboxCountGaugeRegistration metric.Registration
 	createdSandboxesCounter       metric.Int64Counter
-	resumeOriginNodeRemapCounter  metric.Int64Counter
-	pauseRefusalRestoreCounter    metric.Int64Counter
-	networkUpdateUnstoredCounter  metric.Int64Counter
-	noCeilingPlacementsCounter    metric.Int64Counter
-	featureUnsupportedCounter     metric.Int64Counter
-	teamMetricsObserver           *metrics.TeamObserver
-	accessTokenGenerator          *sandbox.AccessTokenGenerator
-	createdCounter                metric.Int64Counter
-	listReadsCounter              metric.Int64Counter
-	listAgeHistogram              metric.Int64Histogram
-	teamLists                     teamListSnapshots
-	snapshotCache                 SnapshotCacheInvalidator
+	// memoryOverrideCounter replaces the package api.sandbox.memory_override
+	// counter when set.
+	memoryOverrideCounter metric.Int64Counter
+	// cpuCountOverrideCounter replaces the package
+	// api.sandbox.cpu_count_override counter when set.
+	cpuCountOverrideCounter metric.Int64Counter
+	// joinExtensionFailedCounter replaces the package
+	// api.sandbox.connect_join_extension_failed counter when set.
+	joinExtensionFailedCounter metric.Int64Counter
+	// joinerRestartCounter replaces the package
+	// api.sandbox.start_joiner_restart counter when set.
+	joinerRestartCounter         metric.Int64Counter
+	resumeOriginNodeRemapCounter metric.Int64Counter
+	pauseRefusalRestoreCounter   metric.Int64Counter
+	networkUpdateUnstoredCounter metric.Int64Counter
+	noCeilingPlacementsCounter   metric.Int64Counter
+	featureUnsupportedCounter    metric.Int64Counter
+	teamMetricsObserver          *metrics.TeamObserver
+	accessTokenGenerator         *sandbox.AccessTokenGenerator
+	createdCounter               metric.Int64Counter
+	listReadsCounter             metric.Int64Counter
+	listAgeHistogram             metric.Int64Histogram
+	teamLists                    teamListSnapshots
+	snapshotCache                SnapshotCacheInvalidator
 
 	snapshotUpsertSem *utils.AdjustableSemaphore
 	redisStorage      *redisbackend.Storage
+
+	// background runs the evictor and the node sync, and the evictions the
+	// sync starts. They use Redis, so Drain stops them and waits before
+	// shutdown closes it.
+	background     sync.WaitGroup
+	stopBackground context.CancelFunc
 
 	// work tracks operations that continue after their caller is gone, so a
 	// drain waits for them instead of killing them mid-write.
@@ -143,6 +163,8 @@ func New(
 	snapshotCache SnapshotCacheInvalidator,
 	snapshotUpsertSem *utils.AdjustableSemaphore,
 	analyticsCreds, nodeCreds credentials.TransportCredentials,
+	// A concrete type: a nil *grpc.ClientConn in an interface would not be nil.
+	schedulingConn *grpc.ClientConn,
 ) (*Orchestrator, error) {
 	analyticsInstance, err := analyticscollector.NewAnalytics(
 		config.AnalyticsCollectorHost,
@@ -214,15 +236,22 @@ func New(
 		localClusterOwnsOrchestrators: skipNomadSync,
 	}
 
+	var storeOpts []sandbox.Option
+	if schedulingConn != nil {
+		storeOpts = append(storeOpts, sandbox.WithRemoteBackend(remote.NewStorage(schedulingConn), remote.NewReservationStorage(schedulingConn), featureFlags))
+	}
 	o.sandboxStore = sandbox.NewStore(
 		redisStorage,
 		redisreservations.NewReservationStorage(redisClient, redisStorage.Notifier()),
 		sandbox.Callbacks{
 			AsyncNewlyCreatedSandbox: o.handleNewlyCreatedSandbox,
 			KillOrphanSandbox:        o.killOrphanSandbox,
-			EndPoweredOffSandbox:     o.endPoweredOffSandbox,
-			EndEndedSandbox:          o.endEndedSandbox,
+			EndPoweredOffSandbox: func(ctx context.Context, sbx sandbox.NodeSandbox) {
+				o.background.Go(func() { o.endPoweredOffSandbox(ctx, sbx) })
+			},
+			EndEndedSandbox: o.endEndedSandbox,
 		},
+		storeOpts...,
 	)
 
 	o.startup = newStartupGate(clusters.StartupReady(), clusters.LocalInstanceJoined(), o.syncClusterDiscoveredNodes)
@@ -236,7 +265,9 @@ func New(
 	// Set before the sync starts, which is the only caller of
 	// endPoweredOffSandbox.
 	o.sandboxEvictor = sandboxEvictor
-	go sandboxEvictor.Start(ctx)
+	backgroundCtx, stopBackground := context.WithCancel(ctx)
+	o.stopBackground = stopBackground
+	o.background.Go(func() { sandboxEvictor.Start(backgroundCtx) })
 
 	teamMetricsObserver, err := metrics.NewTeamObserver(ctx, o.sandboxStore)
 	if err != nil {
@@ -247,7 +278,7 @@ func New(
 
 	o.teamMetricsObserver = teamMetricsObserver
 
-	go o.keepInSync(ctx, o.sandboxStore, skipNomadSync)
+	o.background.Go(func() { o.keepInSync(backgroundCtx, o.sandboxStore, skipNomadSync) })
 
 	if err := o.setupMetrics(tel.MeterProvider); err != nil {
 		logger.L().Error(ctx, "Failed to setup metrics", zap.Error(err))
@@ -290,12 +321,17 @@ func (o *Orchestrator) OutstandingWork() int64 {
 	return o.outstandingWork.Load()
 }
 
-// Drain stops admitting tracked work and waits for what is in flight, bounded
-// by the budget that work stops itself at.
+// Drain stops admitting tracked work and stops the background loops, and
+// waits for what is in flight, bounded by the budget that work stops itself
+// at.
 func (o *Orchestrator) Drain(ctx context.Context) error {
 	o.drainMu.Lock()
 	o.draining = true
 	o.drainMu.Unlock()
+
+	if o.stopBackground != nil {
+		o.stopBackground()
+	}
 
 	ctx, cancel := context.WithTimeout(ctx, trackedWorkBound+workDrainGrace)
 	defer cancel()
@@ -304,6 +340,7 @@ func (o *Orchestrator) Drain(ctx context.Context) error {
 	go func() {
 		defer close(done)
 		o.work.Wait()
+		o.background.Wait()
 	}()
 
 	select {

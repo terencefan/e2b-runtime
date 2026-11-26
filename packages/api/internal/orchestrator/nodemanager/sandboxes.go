@@ -11,9 +11,9 @@ import (
 	"go.opentelemetry.io/otel"
 	"go.uber.org/zap"
 
+	"github.com/e2b-dev/infra/packages/api/internal/db/pkg/types"
 	"github.com/e2b-dev/infra/packages/api/internal/sandbox"
 	"github.com/e2b-dev/infra/packages/api/internal/utils"
-	"github.com/e2b-dev/infra/packages/db/pkg/types"
 	"github.com/e2b-dev/infra/packages/shared/pkg/grpc/orchestrator"
 	"github.com/e2b-dev/infra/packages/shared/pkg/logger"
 )
@@ -83,7 +83,7 @@ func (n *Node) GetOrphanCandidates(ctx context.Context) ([]sandbox.NodeSandbox, 
 			TeamID:      teamID,
 			ExecutionID: cmp.Or(sbx.GetExecutionId(), config.GetExecutionId()),
 			VCpu:        cmp.Or(sbx.GetVcpu(), config.GetVcpu()),
-			RamMB:       cmp.Or(sbx.GetRamMb(), config.GetRamMb()),
+			RamMB:       max(cmp.Or(sbx.GetRamMb(), config.GetRamMb()), sbx.GetMemoryMb()),
 			HugePages:   true,
 			StartTime:   sbx.GetStartTime().AsTime(),
 			NodeID:      n.ID,

@@ -10,15 +10,16 @@ import (
 	"github.com/stretchr/testify/require"
 	"go.opentelemetry.io/otel/metric/noop"
 
+	"github.com/e2b-dev/infra/packages/api/internal/authservice"
+	"github.com/e2b-dev/infra/packages/api/internal/db/pkg/testutils"
 	sharedauth "github.com/e2b-dev/infra/packages/auth/pkg/auth"
 	authtypes "github.com/e2b-dev/infra/packages/auth/pkg/types"
-	"github.com/e2b-dev/infra/packages/db/pkg/testutils"
 )
 
 func newService(db *testutils.Database) (*Service, *recordingCache) {
 	cache := &recordingCache{}
 
-	return NewService(db.AuthDB, db.SqlcClient, cache, noop.NewMeterProvider()), cache
+	return NewService(db.AuthDB, db.SqlcClient, cache, nil, noop.NewMeterProvider()), cache
 }
 
 func teamMembers(t *testing.T, db *testutils.Database, teamID uuid.UUID) []uuid.UUID {
@@ -140,7 +141,7 @@ func (c *recordingCache) InvalidateTeamCache(_ context.Context, teamID uuid.UUID
 // implements the two methods it asserts on.
 type noopAuthService struct{}
 
-var _ sharedauth.Service = noopAuthService{}
+var _ authservice.Service = noopAuthService{}
 
 func (noopAuthService) ValidateAPIKey(context.Context, *gin.Context, string) (*authtypes.Team, *sharedauth.APIError) {
 	return nil, nil

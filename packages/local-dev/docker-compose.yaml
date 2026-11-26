@@ -14,7 +14,7 @@ services:
       - ./clickhouse-config-generated.xml:/etc/clickhouse-server/config.d/config.xml:z
 
   grafana:
-    image: grafana/grafana:12.4.14
+    image: grafana/grafana:13.3.1
     volumes:
       - ./grafana-datasources.yaml:/etc/grafana/provisioning/datasources/datasources.yaml:z
     environment:
@@ -22,12 +22,12 @@ services:
       - GF_AUTH_ANONYMOUS_ORG_ROLE=Admin
       - GF_AUTH_DISABLE_LOGIN_FORM=true
       - GF_FEATURE_TOGGLES_ENABLE=traceqlEditor metricsSummary
-      - GF_INSTALL_PLUGINS=https://storage.googleapis.com/integration-artifacts/grafana-exploretraces-app/grafana-exploretraces-app-latest.zip;grafana-traces-app
+      - GF_PLUGINS_PREINSTALL_SYNC=grafana-exploretraces-app@3.2.0
     ports:
       - "53000:3000"
 
   loki:
-    image: grafana/loki:3.7.9
+    image: grafana/loki:3.7.10
     command: -config.file=/etc/loki/local-config.yaml
     ports:
       - "3100:3100"
@@ -39,7 +39,7 @@ services:
       retries: 12  # try for 2 minutes
 
   memcached:
-    image: memcached:1.6.38
+    image: memcached:1.6.44
     container_name: memcached
     ports:
       - "11211:11211"
@@ -48,7 +48,7 @@ services:
       - MEMCACHED_THREADS=4 # Number of threads to use
 
   mimir:
-    image: grafana/mimir:2.17.1
+    image: grafana/mimir:3.2.6
     command: -config.file=/etc/mimir/mimir.yaml
     volumes:
       - ./mimir.yaml:/etc/mimir/mimir.yaml:z
@@ -74,22 +74,29 @@ services:
       - postgres:/var/lib/postgresql
 
   redis:
-    image: redis:7.4.6
+    image: redis:7.4.11
     ports:
       - "6379:6379"
 
   socks5:
-    image: python:3.12-alpine
-    command: >-
-      sh -c "pip install --quiet pproxy &&
-      exec python -u -m pproxy
-      -l socks5://0.0.0.0:1080#byopuser:byoppass
-      -v"
+    image: python:3.15-alpine
+    command:
+      - sh
+      - -ec
+      - |
+        pip install --quiet pproxy==2.7.9
+        exec python -u -c '
+        import asyncio
+        from pproxy.server import main
+
+        asyncio.set_event_loop(asyncio.new_event_loop())
+        main()
+        ' -l 'socks5://0.0.0.0:1080#byopuser:byoppass' -v
     ports:
       - "1080:1080"
 
   tempo:
-    image: grafana/tempo:2.10.10
+    image: grafana/tempo:3.1.1
     command: [ "-config.file=/etc/tempo.yaml" ]
     volumes:
       - ./tempo.yaml:/etc/tempo.yaml:z

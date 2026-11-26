@@ -67,16 +67,36 @@ type MemoryBackend interface {
 	ServeStats() userfaultfd.ServeSnapshot
 }
 
+// Handler is what the resume path needs from a memory backend beyond
+// MemoryBackend: the switches it flips before the VM starts and the memfd
+// sizing the memory hotplug path drives. The in-process Uffd provides all
+// of it; a data plane that serves memory from another process must too.
+//
+// Start runs under the sandbox's execution context, which is never
+// cancelled by a failed resume, and a resume that fails waits for it before
+// closing the plane: it must not block on an external party such as a
+// handshake that only a running VM would complete. The in-process Uffd
+// opens its listener and returns; a plane's handler must do the same and
+// finish its handshake on its own goroutine.
+type Handler interface {
+	MemoryBackend
+	SetSyncWP(v bool)
+	SetInstallDedup(on bool)
+	SetMemfdUnusedTail(n int64)
+	ExtendMemfd(n int64) error
+	SealMemfd()
+}
+
 // BalloonModeLabeler is implemented by backends whose serve metrics carry the
 // balloon's free-page mechanism once it has been read from Firecracker.
 type BalloonModeLabeler interface {
 	SetBalloonMode(mode userfaultfd.BalloonMode)
 }
 
-// PageStateReporter is implemented by backends whose page tracker sees the
+// MemoryUsageReporter is implemented by backends whose page tracker sees the
 // guest's memory faults.
-type PageStateReporter interface {
-	// PageStateBytes returns the guest memory in each page-tracker state, in
-	// bytes, and false until the tracker exists.
-	PageStateBytes() ([block.NumStates]int64, bool)
+type MemoryUsageReporter interface {
+	// MemoryUsage returns page-state bytes and accumulated held memory,
+	// and false until the tracker exists.
+	MemoryUsage() (block.MemoryUsage, bool)
 }

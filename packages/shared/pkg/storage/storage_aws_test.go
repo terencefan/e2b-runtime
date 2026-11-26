@@ -38,7 +38,9 @@ func TestAWSPartUploader_PartUploaderContract(t *testing.T) {
 			client := newTestS3Client(t, func(w http.ResponseWriter, r *http.Request) {
 				switch {
 				case r.Method == http.MethodPost && r.URL.RawQuery == "uploads=":
-					require.Equal(t, "SHA256", r.Header.Get("x-amz-checksum-algorithm"))
+					if !assert.Equal(t, "SHA256", r.Header.Get("x-amz-checksum-algorithm")) {
+						return
+					}
 					recorder.started = true
 					w.WriteHeader(http.StatusOK)
 					w.Write([]byte(`<InitiateMultipartUploadResult><UploadId>contract-upload-id</UploadId></InitiateMultipartUploadResult>`))
@@ -46,16 +48,16 @@ func TestAWSPartUploader_PartUploaderContract(t *testing.T) {
 					recordUploadedPart(t, recorder, w, r)
 				case r.Method == http.MethodPost && strings.Contains(r.URL.RawQuery, "uploadId=contract-upload-id"):
 					var complete completeMultipartUploadRequest
-					if err := xml.NewDecoder(r.Body).Decode(&complete); err != nil {
-						t.Fatalf("decode complete upload request: %v", err)
+					if !assert.NoError(t, xml.NewDecoder(r.Body).Decode(&complete), "decode complete upload request") {
+						return
 					}
 					recorder.completed = true
-					if len(complete.Parts) == 2 && (complete.Parts[0].PartNumber != 1 || complete.Parts[1].PartNumber != 2) {
-						t.Fatalf("complete upload parts not sorted: %+v", complete.Parts)
+					if len(complete.Parts) == 2 && !assert.Equal(t, []int{1, 2}, []int{complete.Parts[0].PartNumber, complete.Parts[1].PartNumber}, "complete upload parts not sorted") {
+						return
 					}
 					for _, p := range complete.Parts {
-						if p.ChecksumSHA256 == "" {
-							t.Fatalf("complete upload part %d missing SHA256 checksum", p.PartNumber)
+						if !assert.NotEmpty(t, p.ChecksumSHA256, "complete upload part %d missing SHA256 checksum", p.PartNumber) {
+							return
 						}
 					}
 					w.WriteHeader(http.StatusOK)
@@ -64,7 +66,7 @@ func TestAWSPartUploader_PartUploaderContract(t *testing.T) {
 					recorder.aborted = true
 					w.WriteHeader(http.StatusNoContent)
 				default:
-					t.Fatalf("unexpected AWS multipart request: %s %s", r.Method, r.URL.String())
+					assert.Failf(t, "unexpected AWS multipart request", "%s %s", r.Method, r.URL.String())
 				}
 			})
 
@@ -99,7 +101,7 @@ func TestAWSCompressedStoreFileSetsUncompressedSizeMetadataAndSizeUsesIt(t *test
 			}
 			w.WriteHeader(http.StatusOK)
 		default:
-			t.Fatalf("unexpected AWS request: %s %s", r.Method, r.URL.String())
+			assert.Failf(t, "unexpected AWS request", "%s %s", r.Method, r.URL.String())
 		}
 	})
 
@@ -130,7 +132,7 @@ func TestAWSCompressedStoreFileAbortsMultipartUploadOnFailure(t *testing.T) {
 			aborted.Store(true)
 			w.WriteHeader(http.StatusNoContent)
 		default:
-			t.Fatalf("unexpected AWS request: %s %s", r.Method, r.URL.String())
+			assert.Failf(t, "unexpected AWS request", "%s %s", r.Method, r.URL.String())
 		}
 	})
 
@@ -183,7 +185,7 @@ func TestAWSCompressedStoreFileRoundTripsThroughOpenRangeReader(t *testing.T) {
 			w.WriteHeader(http.StatusPartialContent)
 			w.Write(frame)
 		default:
-			t.Fatalf("unexpected AWS request: %s %s", r.Method, r.URL.String())
+			assert.Failf(t, "unexpected AWS request", "%s %s", r.Method, r.URL.String())
 		}
 	})
 
@@ -229,7 +231,7 @@ func TestAWSCompressedStoreFileEmptyFile(t *testing.T) {
 			w.WriteHeader(http.StatusOK)
 			w.Write([]byte(`<CompleteMultipartUploadResult><Bucket>test-bucket</Bucket><Key>test-object</Key><ETag>"complete-etag"</ETag></CompleteMultipartUploadResult>`))
 		default:
-			t.Fatalf("unexpected AWS request: %s %s", r.Method, r.URL.String())
+			assert.Failf(t, "unexpected AWS request", "%s %s", r.Method, r.URL.String())
 		}
 	})
 

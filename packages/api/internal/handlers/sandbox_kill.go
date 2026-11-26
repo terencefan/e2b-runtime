@@ -10,7 +10,7 @@ import (
 	"github.com/google/uuid"
 	"go.uber.org/zap"
 
-	"github.com/e2b-dev/infra/packages/api/internal/db"
+	db "github.com/e2b-dev/infra/packages/api/internal/db/readmodel"
 	"github.com/e2b-dev/infra/packages/api/internal/orchestrator"
 	"github.com/e2b-dev/infra/packages/api/internal/sandbox"
 	"github.com/e2b-dev/infra/packages/api/internal/utils"
@@ -61,8 +61,9 @@ func (a *APIStore) DeleteSandboxesSandboxID(
 	telemetry.ReportEvent(ctx, "killing sandbox")
 
 	claimID, killedOrRemoved, err := a.orchestrator.KillAndClaim(ctx, teamID, sandboxID, sandbox.RemoveOpts{
-		Action: sandbox.StateActionKill,
-		Reason: sandbox.KillReasonRequest,
+		WaitForLifecycleHold: true,
+		Action:               sandbox.StateActionKill,
+		Reason:               sandbox.KillReasonRequest,
 	})
 	switch {
 	case err == nil:

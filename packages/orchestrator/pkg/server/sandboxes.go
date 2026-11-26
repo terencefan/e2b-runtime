@@ -386,6 +386,28 @@ func (s *Server) Create(ctx context.Context, req *orchestrator.SandboxCreateRequ
 			return nil, err
 		}
 	}
+	// Admission charged boot RAM. The rest of the size the start will run at, a named size, the one
+	// a memory resume's snapshot had asked for, or the one a cold boot plugs back, is checked
+	// against the template and then charged, so a size the template cannot take is refused as the
+	// caller's error, not as a node short of memory for it. The charge is held until Create
+	// returns, which covers a cold boot's wait for its plug; past that a cold-booted guest's memory
+	// counts in the pool only as it touches it.
+	startMB, requestedHotplugMB, err := startMemory(meta, config, filesystemBooted)
+	if err != nil {
+		if refusal := s.memoryHotplugRefusal(ctx, err, runtime); refusal != nil {
+			return nil, refusal
+		}
+
+		return nil, err
+	}
+	if requestedHotplugMB > 0 {
+		// The handshake reserves whole slots, so the charge is the request rounded up to one.
+		releaseRequested, err := s.admitHugePagesMB(ctx, runtime.SandboxID, fc.MemoryHotplugUsableMB(requestedHotplugMB, 0))
+		if err != nil {
+			return nil, err
+		}
+		defer releaseRequested()
+	}
 
 	// Read before the start too: a teardown that ends during it gave its pages
 	// back after the mmap failed, so a retry would find them.
@@ -468,7 +490,7 @@ func (s *Server) Create(ctx context.Context, req *orchestrator.SandboxCreateRequ
 
 			return nil, refusal
 		}
-		if refusal := s.memoryRefusal(ctx, err, req.GetSandbox().GetRamMb(), stoppingBefore, runtime); refusal != nil {
+		if refusal := s.memoryRefusal(ctx, err, startMB, stoppingBefore, runtime); refusal != nil {
 			// Placement may retry this node with the same sandbox ID within a
 			// millisecond, and the ID stays reserved until the rollback has run
 			// (finishSandboxStart runs it on a goroutine), so run it now. It
@@ -623,6 +645,7 @@ func sandboxConfigOf(api *orchestrator.SandboxConfig, firecracker fc.Config) (*s
 		Vcpu:              api.GetVcpu(),
 		ConfiguredVmVcpus: api.GetMaxVcpus(),
 		RamMB:             api.GetRamMb(),
+		MemoryMB:          api.GetMemoryMb(),
 		TotalDiskSizeMB:   api.GetTotalDiskSizeMb(),
 		HugePages:         true,
 
@@ -901,12 +924,12 @@ func (s *Server) List(ctx context.Context, _ *emptypb.Empty) (*orchestrator.Sand
 		entry := &orchestrator.RunningSandbox{
 			ClientId:    s.info.ClientId,
 			StartTime:   timestamppb.New(startedAt),
-			EndTime:     timestamppb.New(sbx.GetEndAt()),
 			SandboxId:   sbx.Runtime.SandboxID,
 			TeamId:      sbx.Runtime.TeamID,
 			ExecutionId: sbx.Runtime.ExecutionID,
 			Vcpu:        sbx.Config.Vcpu,
 			RamMb:       sbx.Config.RamMB,
+			MemoryMb:    new(sbx.MemoryMB()),
 		}
 		if sbx.GuestPoweredOff() {
 			entry.Ended = true
@@ -920,12 +943,12 @@ func (s *Server) List(ctx context.Context, _ *emptypb.Empty) (*orchestrator.Sand
 		sandboxes = append(sandboxes, &orchestrator.RunningSandbox{
 			ClientId:    s.info.ClientId,
 			StartTime:   timestamppb.New(e.StartedAt),
-			EndTime:     timestamppb.New(e.EndAt),
 			SandboxId:   e.SandboxID,
 			TeamId:      e.TeamID,
 			ExecutionId: e.ExecutionID,
 			Vcpu:        e.Vcpu,
 			RamMb:       e.RamMB,
+			MemoryMb:    new(e.MemoryMB),
 			Ended:       true,
 			GuestEvent:  guestEventProto(e.GuestEvent),
 		})
@@ -1585,58 +1608,104 @@ func (s *Server) admitEnvd(ctx context.Context, sbx *sandbox.Sandbox, rpc string
 
 		return false, nil
 	}
+	refuse := func(cause envdProbeCause, err error) (bool, error) {
+		s.recordAdmission(ctx, sbx.Runtime.TeamID, rpc, outcome, cause, waited)
+
+		return false, err
+	}
 
 	// A guest that powered off while the probe waited is kept with its
 	// disk, not gone: the retryable refusal keeps the record for the
 	// disk-only pause that follows, whatever the caller allows.
 	if sbx.GuestPoweredOff() {
-		s.recordPauseAdmission(ctx, sbx.Runtime.TeamID, rpc, outcome, waited)
-
-		return false, envdUnresponsiveStatus(sbx.Runtime.SandboxID).Err()
+		return refuse(envdProbePoweredOff, envdUnresponsiveStatus(sbx.Runtime.SandboxID).Err())
 	}
 	// An in-place checkpoint keeps the entry listed with the guest frozen,
 	// so its marker is read first. Cleanup keeps the entry until its end,
 	// so the exit is read with the map; only this execution's exit counts.
 	// Neither is a hung agent, so neither is proceeded past.
 	if sbx.CheckpointInFlight() {
-		s.recordPauseAdmission(ctx, sbx.Runtime.TeamID, rpc, outcome, waited)
-
-		return false, held
+		return refuse(envdProbeCheckpointInFlight, held)
 	}
 	cur, live := s.sandboxFactory.Sandboxes.Get(sbx.Runtime.SandboxID)
 	if !live || (cur == sbx && sbx.Exited() && !s.exitMayKeepSandbox(ctx, sbx)) {
-		s.recordPauseAdmission(ctx, sbx.Runtime.TeamID, rpc, outcome, waited)
 		// A reboot in place that took the sandbox while the probe waited
 		// is retryable too, with the detail the API restores the record
 		// on whatever its restore flag says.
 		if s.sandboxFactory.Sandboxes.Rebooting(sbx.Runtime.SandboxID) {
-			return false, checkpointInProgressStatus(codes.ResourceExhausted, "sandbox '%s' is rebooting, please retry", sbx.Runtime.SandboxID).Err()
+			return refuse(envdProbeRebooting, checkpointInProgressStatus(codes.ResourceExhausted, "sandbox '%s' is rebooting, please retry", sbx.Runtime.SandboxID).Err())
 		}
 		if s.detachedCheckpointFor(sbx.Runtime.SandboxID) != nil {
-			return false, held
+			return refuse(envdProbeCheckpointInFlight, held)
 		}
 		// The claim can end between the two reads, leaving a live
 		// successor and no claim; a second read tells it from a gone one.
-		if cur, live := s.sandboxFactory.Sandboxes.Get(sbx.Runtime.SandboxID); live && (cur != sbx || !sbx.Exited()) {
-			return false, held
+		if cur, live := s.sandboxFactory.Sandboxes.Get(sbx.Runtime.SandboxID); live {
+			if cur != sbx {
+				return refuse(envdProbeSuperseded, held)
+			}
+			// This execution, listed again: a checkpoint that captured
+			// nothing put it back, so the checkpoint is the cause unless
+			// the power-off it found has been read by now.
+			if !sbx.Exited() {
+				if sbx.GuestPoweredOff() {
+					return refuse(envdProbePoweredOff, held)
+				}
+
+				return refuse(envdProbeCheckpointInFlight, held)
+			}
+		}
+		if sbx.Exited() {
+			return refuse(envdProbeExited, status.Error(codes.NotFound, "sandbox not found"))
 		}
 
-		return false, status.Error(codes.NotFound, "sandbox not found")
+		return refuse(envdProbeNotFound, status.Error(codes.NotFound, "sandbox not found"))
 	}
 	// Only a live execution that is this one is proceeded past: a successor
 	// under the same ID means the probed one is gone, and the retryable
 	// refusal keeps the API's record of the successor.
 	if strict || cur != sbx || sbx.Exited() {
-		s.recordPauseAdmission(ctx, sbx.Runtime.TeamID, rpc, outcome, waited)
+		cause := envdProbeUnanswered
+		switch {
+		case cur != sbx:
+			cause = envdProbeSuperseded
+		case sbx.Exited():
+			cause = envdProbeExitedHeld
+		}
 		sbxlogger.E(sbx).Warn(ctx, "Refusing "+rpc+": envd is not answering health checks", zap.Duration("probe", waited))
 
-		return false, envdUnresponsiveStatus(sbx.Runtime.SandboxID).Err()
+		return refuse(cause, envdUnresponsiveStatus(sbx.Runtime.SandboxID).Err())
 	}
-	s.recordPauseAdmission(ctx, sbx.Runtime.TeamID, rpc, sandbox.SnapshotAdmissionEnvdUnhealthyProceeded, waited)
+	s.recordAdmission(ctx, sbx.Runtime.TeamID, rpc, sandbox.SnapshotAdmissionEnvdUnhealthyProceeded, envdProbeUnanswered, waited)
 	sbxlogger.E(sbx).Warn(ctx, "Proceeding with "+rpc+" although envd is not answering health checks; the snapshot is recorded as taken over an unresponsive guest agent", zap.Duration("probe", waited))
 
 	return true, nil
 }
+
+// envdProbeCause is why the envd probe did not admit a snapshot: the cause
+// attribute beside the envd_unhealthy outcomes on the admission counter. The
+// meanings here are the vocabulary's one source; the counter description
+// lists the names and the dashboard panel paraphrases them for its reader.
+type envdProbeCause string
+
+const (
+	// envdProbeUnanswered: envd did not answer /health on a live execution that is this one.
+	envdProbeUnanswered envdProbeCause = "unanswered"
+	// envdProbePoweredOff: the guest powered off while the probe waited; the sandbox is kept with its disk.
+	envdProbePoweredOff envdProbeCause = "powered_off"
+	// envdProbeCheckpointInFlight: a checkpoint, in place or detached, holds the guest.
+	envdProbeCheckpointInFlight envdProbeCause = "checkpoint_in_flight"
+	// envdProbeRebooting: a reboot in place took the sandbox while the probe waited.
+	envdProbeRebooting envdProbeCause = "rebooting"
+	// envdProbeSuperseded: a successor execution holds the sandbox ID.
+	envdProbeSuperseded envdProbeCause = "superseded"
+	// envdProbeExited: the probed execution exited and is gone; the caller is answered not found.
+	envdProbeExited envdProbeCause = "exited"
+	// envdProbeExitedHeld: the probed execution exited while the lifecycle may still keep its sandbox listed; the caller is told to retry.
+	envdProbeExitedHeld envdProbeCause = "exited_held"
+	// envdProbeNotFound: the execution left the live map without exiting.
+	envdProbeNotFound envdProbeCause = "not_found"
+)
 
 // exitMayKeepSandbox reports whether an execution's exit can leave its
 // sandbox listed rather than gone: a guest held after it powered off, or
@@ -1651,19 +1720,31 @@ func (s *Server) exitMayKeepSandbox(ctx context.Context, sbx *sandbox.Sandbox) b
 		s.featureFlags.BoolFlag(ctx, featureflags.GuestRebootInPlaceFlag)
 }
 
-// recordPauseAdmission records one admission decision. The wait histogram
-// samples only the outcomes that actually waited or probed; an empty outcome
-// (the caller's context ended mid-wait) records nothing — no decision was made.
+// recordPauseAdmission records one admission decision that names no cause.
 func (s *Server) recordPauseAdmission(ctx context.Context, teamID, rpc string, outcome sandbox.SnapshotAdmissionOutcome, waited time.Duration) {
+	s.recordAdmission(ctx, teamID, rpc, outcome, "", waited)
+}
+
+// recordAdmission records one admission decision; cause is kept only on the
+// probe's not-admitted outcomes, as the counter's description promises, so
+// the sums by outcome and rpc stay what they were. The wait histogram
+// samples only the outcomes that actually waited or probed; an empty outcome
+// (the caller's context ended mid-wait) records nothing — no decision was
+// made.
+func (s *Server) recordAdmission(ctx context.Context, teamID, rpc string, outcome sandbox.SnapshotAdmissionOutcome, cause envdProbeCause, waited time.Duration) {
 	if outcome == "" {
 		return
 	}
 
-	s.pauseAdmissionCounter.Add(ctx, 1, metric.WithAttributes(
+	attrs := []attribute.KeyValue{
 		attribute.String("outcome", string(outcome)),
 		attribute.String("rpc", rpc),
 		telemetry.WithTeamID(teamID),
-	))
+	}
+	if cause != "" && (outcome == sandbox.SnapshotAdmissionEnvdUnhealthy || outcome == sandbox.SnapshotAdmissionEnvdUnhealthyProceeded) {
+		attrs = append(attrs, attribute.String("cause", string(cause)))
+	}
+	s.pauseAdmissionCounter.Add(ctx, 1, metric.WithAttributes(attrs...))
 
 	if outcome == sandbox.SnapshotAdmissionReadyAfterWait || outcome == sandbox.SnapshotAdmissionRefused ||
 		outcome == sandbox.SnapshotAdmissionEnvdHealthy || outcome == sandbox.SnapshotAdmissionEnvdUnhealthy ||
@@ -2788,7 +2869,7 @@ func (s *Server) getSandboxExecutionData(sbx *sandbox.Sandbox) map[string]any {
 	return map[string]any{
 		"started_at":     startedAt.UTC().Format(time.RFC3339),
 		"vcpu_count":     sbx.Config.Vcpu,
-		"memory_mb":      sbx.Config.RamMB,
+		"memory_mb":      sbx.MemoryMB(),
 		"execution_time": time.Since(startedAt).Milliseconds(),
 	}
 }
@@ -3669,12 +3750,31 @@ func (s *Server) maybeUpgradeEnvd(ctx context.Context, sbx *sandbox.Sandbox) (up
 		return false, nil
 	}
 
+	// The new envd starts without the sandbox's environment variables, and a memory
+	// resume's config has none to send it: the guest held them in memory. Read them from
+	// the running envd so the post-upgrade /init restores them. When they cannot be read,
+	// or differ from the ones the start was configured with, decline: the current envd
+	// keeps serving them, while a replaced one would drop them with a 200 on every RPC.
+	envVarCount, err := sbx.CaptureEnvdEnvVars(ctx, envdEnvVarsTimeout)
+	if err != nil {
+		reason := envdUpgradeGateEnvVarsUnavailable
+		if errors.Is(err, sandbox.ErrEnvdEnvVarsConflict) {
+			reason = envdUpgradeGateEnvVarsConflict
+		}
+		s.envdUpgradeGated.Add(ctx, 1, metric.WithAttributes(attribute.String("reason", reason)))
+		sbxlogger.I(sbx).Warn(ctx, "envd auto-upgrade: sandbox environment variables not restorable; deferring",
+			zap.Error(err), zap.String("reason", reason), zap.String("from", from), zap.String("to", toVersion))
+
+		return false, nil
+	}
+
 	attempted = true
 	start = time.Now()
 
 	upCtx, span := tracer.Start(ctx, "envd-upgrade", trace.WithAttributes(
 		attribute.String("envd.from_version", from),
 		attribute.String("envd.to_version", toVersion),
+		attribute.Int("envd.upgrade.env_vars_captured", envVarCount),
 	))
 	defer span.End()
 
@@ -3806,7 +3906,7 @@ func (s *Server) maybeUpgradeEnvd(ctx context.Context, sbx *sandbox.Sandbox) (up
 	span.SetAttributes(attribute.Bool("envd.upgraded", true))
 
 	// Record the handover outcome the new envd reported on /init (fleet
-	// visibility into what it re-adopted). Per item (proc|retained|watcher) as
+	// visibility into what it re-adopted). Per item (proc|retained|watcher|env_vars) as
 	// ok/failed so failed/(ok+failed) is the handover error rate — a non-zero
 	// failed means the swap dropped or degraded something (a lost watch, an
 	// unrecoverable exit code, a bad process config), which envd otherwise only
@@ -3821,6 +3921,9 @@ func (s *Server) maybeUpgradeEnvd(ctx context.Context, sbx *sandbox.Sandbox) (up
 		recordItem("proc", h.Procs-h.ProcsFailed, h.ProcsFailed)
 		recordItem("retained", h.Retained-h.RetainedFailed, h.RetainedFailed)
 		recordItem("watcher", h.Watchers-h.WatchersFailed, h.WatchersFailed)
+		// Zero from an envd whose blob predates the field, and from a sandbox with no
+		// variables; the post-upgrade /init is the other way they are restored.
+		recordItem("env_vars", h.EnvVars, 0)
 
 		span.SetAttributes(
 			attribute.Int("envd.handover.procs", h.Procs),
@@ -3829,14 +3932,18 @@ func (s *Server) maybeUpgradeEnvd(ctx context.Context, sbx *sandbox.Sandbox) (up
 			attribute.Int("envd.handover.retained_failed", h.RetainedFailed),
 			attribute.Int("envd.handover.watchers", h.Watchers),
 			attribute.Int("envd.handover.watchers_failed", h.WatchersFailed),
+			attribute.Int("envd.handover.env_vars", h.EnvVars),
 		)
 		sbxlogger.I(sbx).Info(upCtx, "envd auto-upgrade: complete",
 			zap.String("to", toVersion),
+			zap.Int("env_vars_captured", envVarCount),
 			zap.Int("procs", h.Procs), zap.Int("procs_failed", h.ProcsFailed),
 			zap.Int("retained", h.Retained), zap.Int("retained_failed", h.RetainedFailed),
-			zap.Int("watchers", h.Watchers), zap.Int("watchers_failed", h.WatchersFailed))
+			zap.Int("watchers", h.Watchers), zap.Int("watchers_failed", h.WatchersFailed),
+			zap.Int("env_vars", h.EnvVars))
 	} else {
-		sbxlogger.I(sbx).Info(upCtx, "envd auto-upgrade: complete", zap.String("to", toVersion))
+		sbxlogger.I(sbx).Info(upCtx, "envd auto-upgrade: complete",
+			zap.String("to", toVersion), zap.Int("env_vars_captured", envVarCount))
 	}
 
 	return true, nil
@@ -3848,7 +3955,17 @@ func (s *Server) maybeUpgradeEnvd(ctx context.Context, sbx *sandbox.Sandbox) (up
 const (
 	envdUpgradeGateNoDefaultUser     = "no_default_user"
 	envdUpgradeGateUnprovableWorkdir = "unprovable_workdir"
+	// envdUpgradeGateEnvVarsUnavailable: the running envd's environment variables could not
+	// be read, so the post-upgrade /init could not restore them.
+	envdUpgradeGateEnvVarsUnavailable = "env_vars_unavailable"
+	// envdUpgradeGateEnvVarsConflict: the start's configured environment variables differ
+	// from the running envd's, and which set an upgrade keeps is not decided.
+	envdUpgradeGateEnvVarsConflict = "env_vars_conflict"
 )
+
+// envdEnvVarsTimeout bounds the read of the running envd's environment variables before a
+// live upgrade. It is a local GET answered from memory.
+const envdEnvVarsTimeout = 5 * time.Second
 
 // envdPreservesExecContext reports whether the running envd will carry its exec context
 // across its own replacement without the host re-sending anything.
@@ -3925,13 +4042,18 @@ func (s *Server) memoryHotplugRefusal(ctx context.Context, err error, runtime sa
 	if !ok {
 		return nil
 	}
-	logger.L().Warn(ctx, "start refused: the sandbox's memory hotplug region cannot run here", zap.Error(err),
+	// A requested size the sandbox cannot take is the caller's error; the rest are the platform's.
+	code, message := codes.FailedPrecondition, "start refused: the sandbox's memory hotplug region cannot run here"
+	if errors.Is(err, fc.ErrMemoryRequestInvalid) {
+		code, message = codes.InvalidArgument, "start refused: the requested memory does not fit the sandbox"
+	}
+	logger.L().Warn(ctx, message, zap.Error(err),
 		zap.String("reason", reason),
 		logger.WithSandboxID(runtime.SandboxID),
 		logger.WithBuildID(runtime.BuildID),
 		logger.WithTemplateID(runtime.TemplateID))
 
-	return createRefused(ctx, codes.FailedPrecondition, "memory hotplug refused (%s): %s", reason, err.Error())
+	return createRefused(ctx, code, "memory hotplug refused (%s): %s", reason, err.Error())
 }
 
 // countMemoryHotplugRefusal counts err when it is a memory hotplug refusal, returning its reason.

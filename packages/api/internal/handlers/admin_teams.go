@@ -12,11 +12,11 @@ import (
 	"go.uber.org/zap"
 
 	"github.com/e2b-dev/infra/packages/api/internal/api"
-	"github.com/e2b-dev/infra/packages/db/pkg/dberrors"
-	"github.com/e2b-dev/infra/packages/db/queries"
+	"github.com/e2b-dev/infra/packages/api/internal/db/queries"
 	"github.com/e2b-dev/infra/packages/shared/pkg/ginutils"
 	"github.com/e2b-dev/infra/packages/shared/pkg/id"
 	"github.com/e2b-dev/infra/packages/shared/pkg/logger"
+	"github.com/e2b-dev/infra/packages/shared/pkg/postgres/dberrors"
 	sharedutils "github.com/e2b-dev/infra/packages/shared/pkg/utils"
 )
 
@@ -165,6 +165,18 @@ func (a *APIStore) GetUnstableAdminTeamsTeamID(c *gin.Context, teamID openapi_ty
 		return
 	}
 
+	var clusterName *string
+	cluster, err := a.lookUpCluster(ctx, row.ClusterID)
+	if err != nil {
+		logger.L().Error(ctx, "Failed to read the team's cluster", zap.Error(err), logger.WithTeamID(teamID.String()))
+		a.sendAPIStoreError(c, http.StatusInternalServerError, "Failed to get team")
+
+		return
+	}
+	if cluster != nil {
+		clusterName = new(cluster.GetName())
+	}
+
 	c.JSON(http.StatusOK, api.AdminTeam{
 		Id:                      row.ID,
 		Email:                   row.Email,
@@ -176,7 +188,7 @@ func (a *APIStore) GetUnstableAdminTeamsTeamID(c *gin.Context, teamID openapi_ty
 		BlockedReason:           row.BlockedReason,
 		SandboxSchedulingLabels: row.SandboxSchedulingLabels,
 		ClusterId:               row.ClusterID,
-		ClusterName:             row.ClusterName,
+		ClusterName:             clusterName,
 	})
 }
 

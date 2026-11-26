@@ -171,6 +171,8 @@ func (f *rebootFixture) start(ctx context.Context, from *Sandbox, endAt time.Tim
 	next.Runtime = from.Runtime
 	next.slotRelease = newHandover(h.releaseSlot)
 	next.cleanup.Add(ctx, next.slotRelease.run)
+	next.planeRelease = newHandover(h.releasePlane)
+	next.cleanup.Add(ctx, next.planeRelease.run)
 	next.rootfsRelease = newHandover(h.releaseRootfs)
 	next.cleanup.Add(ctx, next.rootfsRelease.run)
 
@@ -322,7 +324,7 @@ func TestRebootInPlaceLookupsWaitForTheBoot(t *testing.T) {
 
 			select {
 			case <-looked:
-				require.FailNow(t, "the lookup returned during the boot")
+				require.Fail(t, "the lookup returned during the boot")
 			case <-time.After(50 * time.Millisecond):
 			}
 
@@ -610,7 +612,7 @@ func TestRebootInPlaceCancelBootOutlastingTheCaller(t *testing.T) {
 		synctest.Wait()
 		select {
 		case <-retried:
-			require.FailNow(t, "the retry returned while the boot still held the sandbox")
+			require.Fail(t, "the retry returned while the boot still held the sandbox")
 		default:
 		}
 

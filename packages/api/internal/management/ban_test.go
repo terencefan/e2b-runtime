@@ -14,8 +14,8 @@ import (
 	"github.com/stretchr/testify/require"
 	"go.opentelemetry.io/otel/metric/noop"
 
-	dbmodule "github.com/e2b-dev/infra/packages/db"
-	"github.com/e2b-dev/infra/packages/db/pkg/testutils"
+	dbmodule "github.com/e2b-dev/infra/packages/api/internal/db"
+	"github.com/e2b-dev/infra/packages/api/internal/db/pkg/testutils"
 )
 
 func TestApplyProjectBanBansTheTeamAndEnqueuesItsContainment(t *testing.T) {
@@ -106,7 +106,7 @@ func TestApplyProjectBanRetriesFailedCacheInvalidation(t *testing.T) {
 
 	db := testutils.SetupDatabase(t)
 	cache := &failingBlockCache{err: errors.New("cache unavailable")}
-	service := NewService(db.AuthDB, db.SqlcClient, cache, noop.NewMeterProvider())
+	service := NewService(db.AuthDB, db.SqlcClient, cache, nil, noop.NewMeterProvider())
 	jobs := newJobInserter(t, db)
 	teamID := testutils.CreateTestTeam(t, db)
 	projection := ProjectBanProjection{ProjectID: teamID, Revision: 1, Banned: true}

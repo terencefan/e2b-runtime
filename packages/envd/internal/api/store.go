@@ -16,6 +16,7 @@ import (
 	"github.com/e2b-dev/infra/packages/envd/internal/services/cgroups"
 	"github.com/e2b-dev/infra/packages/envd/internal/services/cpus"
 	"github.com/e2b-dev/infra/packages/envd/internal/services/fsfreeze"
+	"github.com/e2b-dev/infra/packages/envd/internal/services/memlimit"
 	"github.com/e2b-dev/infra/packages/envd/internal/utils"
 )
 
@@ -35,6 +36,13 @@ func (noopLogFlusher) FlushAndPurge(context.Context) error { return nil }
 
 // NewNoopLogFlusher returns a log flusher that performs no work.
 func NewNoopLogFlusher() LogFlusher { return noopLogFlusher{} }
+
+// LocalhostForwarder is the port forwarder's switch for services bound to
+// loopback, set by /init.
+type LocalhostForwarder interface {
+	SetLocalhostForwarding(on bool) error
+	Release()
+}
 
 // DefaultMMDSClient is the production implementation that calls the real MMDS endpoint.
 type DefaultMMDSClient struct{}
@@ -84,6 +92,10 @@ type API struct {
 	// cpuManager applies the target online CPU count.
 	cpuManager cpus.Manager
 
+	// memLimits keeps the user and PTY cgroups' memory limit sized to the guest's
+	// current memory.
+	memLimits memlimit.Manager
+
 	// handover, when non-nil, is the outcome of the live-upgrade handover this
 	// envd booted from; PostInit advertises it to the orchestrator via the
 	// X-Envd-Handover header. Set once at startup, before serving.
@@ -106,6 +118,14 @@ type API struct {
 	// re-adopted (possibly hostile) guest process can neither drive an upgrade
 	// nor be handed a running workload before /init has re-established auth.
 	initialized atomic.Bool
+
+	forwarder LocalhostForwarder
+}
+
+// SetLocalhostForwarder must be called before serving: the forwarder is built
+// after the API.
+func (a *API) SetLocalhostForwarder(f LocalhostForwarder) {
+	a.forwarder = f
 }
 
 // Initialized reports whether the first authenticated /init has completed.
@@ -130,6 +150,7 @@ type handoverResult struct {
 	RetainedFailed int `json:"retained_failed"`
 	Watchers       int `json:"watchers"`
 	WatchersFailed int `json:"watchers_failed"`
+	EnvVars        int `json:"env_vars"`
 }
 
 // SetHandoverResult records the live-upgrade handover outcome so PostInit can
@@ -137,7 +158,7 @@ type handoverResult struct {
 // via --resume-handover. failed reports whether the handover itself failed (the
 // workload was not re-adopted), so the orchestrator can tear the sandbox down
 // rather than mistake the version flip for success.
-func (a *API) SetHandoverResult(failed bool, procs, procsFailed, retained, retainedFailed, watchers, watchersFailed int) {
+func (a *API) SetHandoverResult(failed bool, procs, procsFailed, retained, retainedFailed, watchers, watchersFailed, envVars int) {
 	a.handover = &handoverResult{
 		Failed:         failed,
 		Procs:          procs,
@@ -146,10 +167,11 @@ func (a *API) SetHandoverResult(failed bool, procs, procsFailed, retained, retai
 		RetainedFailed: retainedFailed,
 		Watchers:       watchers,
 		WatchersFailed: watchersFailed,
+		EnvVars:        envVars,
 	}
 }
 
-func New(l *zerolog.Logger, defaults *execcontext.Defaults, mmdsChan chan *host.MMDSOpts, isNotFC bool, workloadFreezer *cgroups.WorkloadFreezer, oomKills *host.OOMWatcher, cpuManager cpus.Manager, logFlushers ...LogFlusher) *API {
+func New(l *zerolog.Logger, defaults *execcontext.Defaults, mmdsChan chan *host.MMDSOpts, isNotFC bool, workloadFreezer *cgroups.WorkloadFreezer, oomKills *host.OOMWatcher, cpuManager cpus.Manager, memLimits memlimit.Manager, logFlushers ...LogFlusher) *API {
 	logFlusher := NewNoopLogFlusher()
 	if len(logFlushers) > 0 && logFlushers[0] != nil {
 		logFlusher = logFlushers[0]
@@ -177,6 +199,7 @@ func New(l *zerolog.Logger, defaults *execcontext.Defaults, mmdsChan chan *host.
 		nfs:                execNFSMounter{},
 		nfsMountRetryFor:   nfsMountTimeout,
 		nfsMountRetryDelay: nfsMountRetryDelay,
+		memLimits:          memLimits,
 	}
 }
 
@@ -215,6 +238,9 @@ func (a *API) GetMetrics(w http.ResponseWriter, r *http.Request) {
 	metrics.CPUTarget = uint32(cpu.Target)
 	metrics.CPUTargetAttempts = uint32(cpu.Attempts)
 	metrics.CPUWritePendingMs = uint64(cpu.WritePending.Milliseconds())
+	mem := a.memLimits.Status()
+	metrics.MemLimit = mem.Limit
+	metrics.MemMovable, metrics.MemKernel, metrics.MemOnlinePolicy = mem.Layout.Movable, mem.Layout.Kernel, mem.Layout.OnlinePolicy
 
 	if a.oomKills != nil {
 		if kills, ok := a.oomKills.Kills(); ok {

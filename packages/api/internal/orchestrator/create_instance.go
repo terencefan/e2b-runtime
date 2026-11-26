@@ -17,14 +17,13 @@ import (
 
 	"github.com/e2b-dev/infra/packages/api/internal"
 	"github.com/e2b-dev/infra/packages/api/internal/api"
+	"github.com/e2b-dev/infra/packages/api/internal/db/pkg/builds"
+	"github.com/e2b-dev/infra/packages/api/internal/db/pkg/types"
+	"github.com/e2b-dev/infra/packages/api/internal/db/queries"
 	"github.com/e2b-dev/infra/packages/api/internal/orchestrator/nodemanager"
 	"github.com/e2b-dev/infra/packages/api/internal/orchestrator/placement"
 	"github.com/e2b-dev/infra/packages/api/internal/sandbox"
-	redisreservations "github.com/e2b-dev/infra/packages/api/internal/sandbox/reservations/redis"
 	teamtypes "github.com/e2b-dev/infra/packages/auth/pkg/types"
-	"github.com/e2b-dev/infra/packages/db/pkg/builds"
-	"github.com/e2b-dev/infra/packages/db/pkg/types"
-	"github.com/e2b-dev/infra/packages/db/queries"
 	"github.com/e2b-dev/infra/packages/shared/pkg/apierrors"
 	"github.com/e2b-dev/infra/packages/shared/pkg/clusters"
 	"github.com/e2b-dev/infra/packages/shared/pkg/consts"
@@ -32,8 +31,8 @@ import (
 	"github.com/e2b-dev/infra/packages/shared/pkg/featureflags"
 	"github.com/e2b-dev/infra/packages/shared/pkg/grpc/orchestrator"
 	"github.com/e2b-dev/infra/packages/shared/pkg/logger"
-	"github.com/e2b-dev/infra/packages/shared/pkg/middleware/otel/joined"
 	sandbox_network "github.com/e2b-dev/infra/packages/shared/pkg/sandbox-network"
+	redisreservations "github.com/e2b-dev/infra/packages/shared/pkg/sandboxstore/reservations/redis"
 	"github.com/e2b-dev/infra/packages/shared/pkg/telemetry"
 	ut "github.com/e2b-dev/infra/packages/shared/pkg/utils"
 )
@@ -68,8 +67,10 @@ type SandboxMetadata struct {
 	EnvdAccessToken         *string
 	// Iam records the sandbox workload identity configuration requested at create
 	// time. Nil means workload identity is disabled.
-	Iam    *types.SandboxIam
-	NodeID *string
+	Iam             *types.SandboxIam
+	PausedTTL       *time.Duration
+	PausedTTLStored bool
+	NodeID          *string
 	// SnapshotSandboxID is the sandbox ID the resume snapshot is stored under.
 	// It differs from the ID of the sandbox being started when forking.
 	SnapshotSandboxID string
@@ -270,10 +271,28 @@ type CreateOption func(*createOptions)
 type createOptions struct {
 	completeStartedCreate bool
 	cpuCount              *int32
+	memoryMB              *int32
+	connect               bool
 }
 
 func WithCPUCount(cpuCount *int32) CreateOption {
 	return func(o *createOptions) { o.cpuCount = cpuCount }
+}
+
+func WithMemoryMB(memoryMB *int32) CreateOption {
+	return func(o *createOptions) { o.memoryMB = memoryMB }
+}
+
+// Connect marks a start asked for by connect. Its memoryMB and cpuCount, like
+// memory, apply only when this request starts the sandbox: the connect handler
+// has already refused a size the snapshot or the team cannot take
+// (CheckSandboxMemory, CheckSandboxCPUCount); here they are checked again once
+// the request holds the start, and ignored when the request joins another start
+// of the sandbox, or finds it running. A connect that joins applies its own
+// timeout to the sandbox it gets, as a connect to a running sandbox does.
+// Create and resume keep refusing to join with a size.
+func Connect() CreateOption {
+	return func(o *createOptions) { o.connect = true }
 }
 
 // CompleteStartedCreate lets a resume create under way, and the bookkeeping
@@ -308,8 +327,22 @@ func (o *Orchestrator) CreateSandbox(
 		option(&opts)
 	}
 
-	if opts.cpuCount != nil {
+	// A connect's count, checked by its handler before the start, is checked
+	// again only once it holds the start, as its size is.
+	if opts.cpuCount != nil && !opts.connect {
 		if apiErr := cpuCountDisabled(ctx, o.featureFlagsClient, team); apiErr != nil {
+			o.recordCPUCountOverride(ctx, cpuCountOverrideRejected, apiErr.ErrorCode)
+
+			return sandbox.Sandbox{}, apiErr
+		}
+	}
+
+	// A connect's size, checked by its handler before the start, is checked
+	// again only once it holds the start: joining another start, it is ignored.
+	if opts.memoryMB != nil && !opts.connect {
+		if apiErr := memoryDisabled(ctx, o.featureFlagsClient, team); apiErr != nil {
+			o.recordMemoryOverride(ctx, memoryOverrideRejected, apiErr.ErrorCode, memorySourceNamed)
+
 			return sandbox.Sandbox{}, apiErr
 		}
 	}
@@ -318,84 +351,28 @@ func (o *Orchestrator) CreateSandbox(
 	totalConcurrentInstances := team.Limits.SandboxConcurrency
 
 	// Check if team has reached max instances
-	reservedAt := time.Now()
-	finishStart, waitForStart, err := o.sandboxStore.Reserve(ctx, team.Team.ID, sandboxID, int(totalConcurrentInstances))
-	if err != nil {
-		var limitErr *sandbox.LimitExceededError
-
-		switch {
-		case errors.As(err, &limitErr):
-			return sandbox.Sandbox{}, &api.APIError{
-				Code: http.StatusTooManyRequests,
-				ClientMsg: fmt.Sprintf(
-					"you have reached the maximum number of concurrent E2B sandboxes (%d). If you need more, "+
-						"please visit 'https://e2b.dev/docs/billing'", totalConcurrentInstances),
-				Err:       fmt.Errorf("team '%s' has reached the maximum number of instances (%d)", team.ID, totalConcurrentInstances),
-				Retryable: apierrors.CanRetry,
-			}
-		case errors.Is(err, sandbox.ErrSandboxKilled):
-			return sandbox.Sandbox{}, &api.APIError{
-				Code:      http.StatusNotFound,
-				ClientMsg: fmt.Sprintf("Sandbox '%s' was deleted", sandboxID),
-				Err:       fmt.Errorf("resume of '%s' refused: %w", sandboxID, err),
-			}
-		default:
-			logger.L().Error(ctx, "failed to reserve sandbox for team", logger.WithSandboxID(sandboxID), zap.Error(err))
-
-			return sandbox.Sandbox{}, &api.APIError{
-				Code:      http.StatusInternalServerError,
-				ClientMsg: fmt.Sprintf("Failed to create sandbox: %s", err),
-				Err:       err,
-				Retryable: apierrors.CanRetry,
-			}
+	var (
+		reservedAt  time.Time
+		finishStart func(sandbox.Sandbox, error)
+	)
+	for attempt := 0; ; attempt++ {
+		reservedAt = time.Now()
+		var waitForStart func(context.Context) (sandbox.Sandbox, error)
+		var reserveErr *api.APIError
+		finishStart, waitForStart, reserveErr = o.reserveStart(ctx, team, sandboxID, int(totalConcurrentInstances))
+		if reserveErr != nil {
+			return sandbox.Sandbox{}, reserveErr
 		}
-	}
-
-	if waitForStart != nil {
-		// A joined request rides whatever start is already in flight — which may
-		// be a memory restore (e.g. a traffic-triggered auto-resume) that an
-		// explicit memory:false must never be silently answered with.
-		if demandFilesystemBoot {
-			return sandbox.Sandbox{}, &api.APIError{
-				Code:      http.StatusConflict,
-				ErrorCode: ErrCodeStartInFlight,
-				ClientMsg: "Sandbox is already starting; memory: false cannot be applied to a start already in flight — retry once it is running or paused",
-				Err:       fmt.Errorf("filesystem-boot resume of '%s' cannot join an in-flight start", sandboxID),
-			}
+		if waitForStart == nil {
+			break
 		}
 
-		if opts.cpuCount != nil {
-			return sandbox.Sandbox{}, &api.APIError{
-				Code:      http.StatusConflict,
-				ErrorCode: ErrCodeStartInFlight,
-				ClientMsg: "Sandbox is already starting; cpuCount cannot be applied to a start already in flight",
-				Err:       fmt.Errorf("CPU override for sandbox %q cannot join an in-flight start", sandboxID),
-				Retryable: apierrors.NoRetry,
-			}
+		joinedSbx, joinErr, retry := o.joinStart(ctx, team, sandboxID, timeout, demandFilesystemBoot, opts, waitForStart, attempt == 0)
+		if retry {
+			continue
 		}
 
-		// Mark as a joined request for telemetry purposes
-		joined.Mark(ctx)
-
-		logger.L().Info(ctx, "sandbox is already being started, waiting for it to be ready", logger.WithSandboxID(sandboxID))
-
-		sbx, err = waitForStart(ctx)
-		if err != nil {
-			logger.L().Warn(ctx, "Error waiting for sandbox to start", zap.Error(err), logger.WithSandboxID(sandboxID))
-
-			if apiErr, ok := errors.AsType[*api.APIError](err); ok {
-				return sandbox.Sandbox{}, apiErr
-			}
-
-			return sandbox.Sandbox{}, &api.APIError{
-				Code:      http.StatusInternalServerError,
-				ClientMsg: "Error waiting for sandbox to start",
-				Err:       err,
-				Retryable: apierrors.NoRetry,
-			}
-		}
-
-		return sbx, nil
+		return joinedSbx, joinErr
 	}
 
 	telemetry.ReportEvent(ctx, "Reserved sandbox for team")
@@ -420,7 +397,7 @@ func (o *Orchestrator) CreateSandbox(
 		// Don't change this handling
 		// https://go.dev/play/p/4oy02s7BDMc
 		if apiErr != nil {
-			finishStart(sbx, apiErr)
+			finishStart(sbx, publishedStartError(apiErr, opts))
 		} else {
 			finishStart(sbx, nil)
 		}
@@ -431,9 +408,14 @@ func (o *Orchestrator) CreateSandbox(
 		return sandbox.Sandbox{}, fetchErr
 	}
 
-	vcpu, cpuErr := resolveSandboxVcpu(ctx, o.featureFlagsClient, team, sandboxID, sbxData.TemplateID, sbxData.Build, opts.cpuCount)
+	vcpu, cpuErr := o.resolveSandboxVcpu(ctx, o.featureFlagsClient, team, sandboxID, sbxData.TemplateID, sbxData.Build, opts.cpuCount)
 	if cpuErr != nil {
 		return sandbox.Sandbox{}, cpuErr
+	}
+
+	memoryMB, memoryKnown, memoryErr := o.resolveSandboxMemory(ctx, o.featureFlagsClient, team, sandboxID, sbxData.TemplateID, sbxData.Build, opts.memoryMB, !isResume)
+	if memoryErr != nil {
+		return sandbox.Sandbox{}, memoryErr
 	}
 
 	if _, err := fcversion.New(sbxData.Build.FirecrackerVersion); err != nil {
@@ -529,6 +511,21 @@ func (o *Orchestrator) CreateSandbox(
 		// byte-identical to before the field existed.
 		sbxRequest.FilesystemBoot = new(true)
 	}
+	if sbxData.Build.MaxRamMb != nil && memoryKnown {
+		// Every start from a build with a memory maximum sends the size the API
+		// accounts and bills, so the orchestrator enforces that number and the
+		// placement gate covers the start. A build that does not record its size
+		// sends none: the orchestrator keeps its snapshot's, which the API does
+		// not know. A build that cannot grow runs at boot RAM, which needs no field.
+		sbxRequest.Sandbox.MemoryMb = memoryMB
+	}
+	if sbxData.Build.MaxRamMb != nil && !memoryKnown {
+		reportMemorySizeUnknown(ctx, "start", sbxData.Build.RamMb, *sbxData.Build.MaxRamMb,
+			logger.WithSandboxID(sandboxID),
+			logger.WithTemplateID(sbxData.TemplateID),
+			logger.WithBuildID(sbxData.Build.ID.String()),
+		)
+	}
 
 	cpuRequirement := o.resolveCPURequirement(ctx, sandboxID, team, sbxData)
 	// Recorded before placement runs: a placement the pin starved is the case
@@ -578,8 +575,9 @@ func (o *Orchestrator) CreateSandbox(
 	allLabels, labelFilteringEnabled := o.generateRequiredNodeLabels(ctx, sandboxID, team, sbxData)
 
 	requirements := placement.Requirements{
-		CPU:    cpuRequirement,
-		Memory: placement.MemoryRequirementFor(ctx, o.featureFlagsClient, team.ID, sandboxID),
+		CPU:       cpuRequirement,
+		Memory:    placement.MemoryRequirementFor(ctx, o.featureFlagsClient, team.ID, sandboxID),
+		MemoryMiB: placementMemoryMiB(sbxData.Build, memoryMB, memoryKnown),
 	}
 
 	placed, err := placement.PlaceSandboxCompletingStartedCreate(ctx, o.placementAlgorithm, clusterNodes, node, sbxRequest, requirements, labelFilteringEnabled, allLabels, completeStartedCreateUntil)
@@ -598,7 +596,7 @@ func (o *Orchestrator) CreateSandbox(
 			o.featureUnsupportedCounter.Add(ctx, 1, metric.WithAttributes(
 				telemetry.WithTeamID(team.TeamID()),
 				attribute.String("feature", strings.Join(unsupportedErr.Features, ",")),
-			))
+			), withCluster(nodeClusterID))
 			logger.L().Warn(ctx, "No orchestrator in the cluster supports a feature the sandbox needs",
 				logger.WithTeamID(team.TeamID()),
 				logger.WithTemplateID(sbxData.TemplateID),
@@ -609,10 +607,30 @@ func (o *Orchestrator) CreateSandbox(
 			)
 		}
 
-		return sandbox.Sandbox{}, placementAPIError(err)
+		// A refused size is the caller's only when it is below the size the API
+		// records; at or above it the node and the API's record disagree.
+		recordedMB, recordedKnown := BuildStartMemoryMB(sbxData.Build.RamMb, sbxData.Build.MaxRamMb, sbxData.Build.StartMemoryMb)
+		callersSize := opts.memoryMB != nil && (!recordedKnown || int64(*opts.memoryMB) < recordedMB)
+		refusalCode := memoryRefusalCodeOf(err)
+		apiErr := placementAPIError(err, callersSize)
+		if opts.memoryMB != nil {
+			outcome, code := placementMemoryOutcome(err, apiErr)
+			if !callersSize && refusalCode != "" {
+				outcome, code = memoryOverrideFailed, apiErr.ErrorCode
+			}
+			o.recordMemoryOverride(ctx, outcome, code, memorySourceNamed)
+		}
+		if !callersSize && refusalCode != "" {
+			reportMemoryRecordMismatch(ctx, err, sandboxID, sbxData, refusalCode, sbxRequest.GetSandbox().GetMemoryMb())
+		}
+
+		return sandbox.Sandbox{}, apiErr
 	}
 
 	node = placed.Node
+	if opts.memoryMB != nil {
+		o.recordMemoryOverride(ctx, memoryOverrideAccepted, "", memorySourceNamed)
+	}
 
 	if !bookkeepingUntil.IsZero() {
 		// The create completed; its bookkeeping must too, for the joiners of
@@ -629,13 +647,13 @@ func (o *Orchestrator) CreateSandbox(
 		attribute.Bool("node_affinity_success", affinityRequested && node.ID == *sbxData.NodeID),
 		telemetry.WithTeamID(team.TeamID()),
 	}
-	o.createdSandboxesCounter.Add(ctx, 1, metric.WithAttributes(attributes...))
+	o.createdSandboxesCounter.Add(ctx, 1, metric.WithAttributes(attributes...), withCluster(node.ClusterID))
 
 	if placed.MissingHugepageCeiling != "" {
 		o.noCeilingPlacementsCounter.Add(ctx, 1, metric.WithAttributes(
 			attribute.String("node.id", node.ID),
 			attribute.String("reason", placed.MissingHugepageCeiling),
-		))
+		), withCluster(node.ClusterID))
 	}
 
 	telemetry.SetAttributes(ctx, attribute.String("node.id", node.ID))
@@ -692,6 +710,19 @@ func (o *Orchestrator) CreateSandbox(
 	)
 	sbx.FirecrackerVersionResolved = resolvedFCVersion
 	sbx.NetworkPlacement = placed.Response.GetNetworkPlacement()
+	sbx.PausedTTL = sbxData.PausedTTL
+	sbx.PausedTTLStored = sbxData.PausedTTLStored
+	if sbxData.Build.MaxRamMb != nil && memoryKnown {
+		// Set whenever the size is known, boot RAM included, so a record that
+		// lost the field reads as unknown and its pause records no size.
+		sbx.MemoryMB = memoryMB
+	}
+	if charged := requirements.MemoryMiB; charged > sbx.TotalMemoryMB() {
+		sbx.PlacedMemoryMB = charged
+	}
+	if names := placement.RequestFeatureNames(sbxRequest); len(names) > 0 {
+		sbx.RequiredFeatures = names
+	}
 
 	// An orchestrator that predates the filesystem_boot field ignores it and
 	// memory-restores; only the echo proves the demand was honored. Kill the
@@ -717,6 +748,34 @@ func (o *Orchestrator) CreateSandbox(
 			ErrorCode: ErrCodeFilesystemBootUnconfirmed,
 			ClientMsg: "This cluster cannot resume without memory yet (memory: false); the resume was rolled back and the snapshot is untouched — retry shortly",
 			Err:       fmt.Errorf("filesystem-boot demand for '%s' not confirmed by node %s", sandboxID, node.ID),
+		}
+	}
+
+	// Before the record exists, so no run end can stamp ahead of it. Without
+	// it a failed stamp would leave the previous pause's expiry, and the
+	// sandbox would be deleted right after this run.
+	if isResume {
+		if err := o.boundPausedExpiry(ctx, sbx); err != nil {
+			// Torn down synchronously: the 503 invites a retry, and an async
+			// kill would race it with the sandbox ID still live on the node.
+			killErr := o.removeSandboxFromNode(
+				context.WithoutCancel(ctx),
+				sbx,
+				sandbox.RemoveOpts{Action: sandbox.StateActionKill, Reason: sandbox.KillReasonUnknown},
+			)
+			if killErr != nil {
+				logger.L().Error(ctx, "Error removing resumed sandbox after its expiry bound failed",
+					zap.Error(killErr),
+					logger.WithSandboxID(sbx.SandboxID),
+				)
+			}
+
+			return sandbox.Sandbox{}, &api.APIError{
+				Code:      http.StatusServiceUnavailable,
+				ClientMsg: "Failed to resume sandbox, retry shortly",
+				Err:       fmt.Errorf("failed to bound the paused expiry of '%s': %w", sandboxID, err),
+				Retryable: apierrors.CanRetry,
+			}
 		}
 	}
 
@@ -796,7 +855,7 @@ func (o *Orchestrator) maybeRemapResumeOriginNode(ctx context.Context, sandboxID
 
 	// Drop the cached snapshot so the next resume reads the new origin node.
 	o.snapshotCache.Invalidate(wctx, sandboxID)
-	o.resumeOriginNodeRemapCounter.Add(wctx, 1, metric.WithAttributes(telemetry.WithTeamID(team.TeamID())))
+	o.resumeOriginNodeRemapCounter.Add(wctx, 1, metric.WithAttributes(telemetry.WithTeamID(team.TeamID())), withCluster(newNode.ClusterID))
 
 	oldNodeID := ""
 	if originNodeID != nil {

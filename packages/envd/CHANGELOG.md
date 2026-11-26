@@ -1,5 +1,46 @@
 # Changelog
 
+## 0.11.1 (2026-11-23)
+
+
+### Bug Fixes
+
+* **deps:** move the workspace to the Go 1.27.4 toolchain (387fa21)
+* **deps:** update module github.com/getkin/kin-openapi to v0.153.0 (bcbbd3b)
+* **deps:** update module github.com/jackc/pgx/v5 to v5.13.0 (7a2996c)
+* **deps:** update module github.com/oapi-codegen/runtime to v1.9.0 (ae142ea)
+* **deps:** update module github.com/pressly/goose/v3 to v3.30.1 (a392e1c)
+* **deps:** update module google.golang.org/api to v0.311.0 (ba4db8a)
+* **envd:** redact process env var values in RPC logs (e01b770)
+
+
+### Dependencies
+
+* **runtime:** refresh Go module dependencies (861ab5b)
+
+
+### Miscellaneous Chores
+
+* **deps:** update module github.com/oapi-codegen/oapi-codegen/v2 to v2.8.2 (d7541ad)
+
+## 0.11.0 (2026-11-20)
+
+
+### Features
+
+* **envd:** keep the user and PTY memory limit in step with hotplugged memory (b1bd7be)
+
+
+### Bug Fixes
+
+* **envd:** carry user env vars across live upgrade (a345880)
+* **envd:** log client-cancelled calls at debug level (050577c)
+
+
+### Miscellaneous Chores
+
+* **envd:** stop generating the handover proto into the shared package (7fc1e1e)
+
 ## 0.10.2 (2026-10-23)
 
 

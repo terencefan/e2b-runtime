@@ -7,8 +7,8 @@ import (
 	"github.com/gin-gonic/gin"
 
 	"github.com/e2b-dev/infra/packages/api/internal/api"
+	"github.com/e2b-dev/infra/packages/api/internal/db/queries"
 	"github.com/e2b-dev/infra/packages/api/internal/utils"
-	"github.com/e2b-dev/infra/packages/db/queries"
 	"github.com/e2b-dev/infra/packages/shared/pkg/telemetry"
 	sharedUtils "github.com/e2b-dev/infra/packages/shared/pkg/utils"
 )
@@ -103,7 +103,8 @@ func (a *APIStore) GetV2Templates(c *gin.Context, params api.GetV2TemplatesParam
 			BuildID:       item.BuildID.String(),
 			CpuCount:      api.CPUCount(item.BuildVcpu),
 			MaxCpuCount:   sharedUtils.CastPtr(item.BuildMaxVcpu, func(v int64) api.CPUCount { return api.CPUCount(v) }),
-			MemoryMB:      api.MemoryMB(item.BuildRamMb),
+			MaxMemoryMB:   sharedUtils.CastPtr(item.BuildMaxRamMb, func(v int64) api.MemoryMB { return api.MemoryMB(v) }),
+			MemoryMB:      templateMemoryMB(item.BuildRamMb, item.BuildMaxRamMb, item.BuildStartMemoryMb),
 			DiskSizeMB:    api.DiskSizeMB(diskMB),
 			Public:        item.Public,
 			Aliases:       item.Aliases,

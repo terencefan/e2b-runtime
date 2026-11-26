@@ -19,16 +19,16 @@ import (
 	"github.com/e2b-dev/infra/packages/api/internal/api"
 	templatecache "github.com/e2b-dev/infra/packages/api/internal/cache/templates"
 	apiclusters "github.com/e2b-dev/infra/packages/api/internal/clusters"
+	"github.com/e2b-dev/infra/packages/api/internal/db/pkg/types"
+	"github.com/e2b-dev/infra/packages/api/internal/db/queries"
 	"github.com/e2b-dev/infra/packages/api/internal/middleware/idempotency"
 	templatemanager "github.com/e2b-dev/infra/packages/api/internal/template-manager"
-	"github.com/e2b-dev/infra/packages/db/pkg/dberrors"
-	"github.com/e2b-dev/infra/packages/db/pkg/types"
-	"github.com/e2b-dev/infra/packages/db/queries"
 	"github.com/e2b-dev/infra/packages/shared/pkg/apierrors"
 	"github.com/e2b-dev/infra/packages/shared/pkg/clusters"
 	"github.com/e2b-dev/infra/packages/shared/pkg/featureflags"
 	"github.com/e2b-dev/infra/packages/shared/pkg/ginutils"
 	"github.com/e2b-dev/infra/packages/shared/pkg/logger"
+	"github.com/e2b-dev/infra/packages/shared/pkg/postgres/dberrors"
 	"github.com/e2b-dev/infra/packages/shared/pkg/telemetry"
 	"github.com/e2b-dev/infra/packages/shared/pkg/templates"
 	"github.com/e2b-dev/infra/packages/shared/pkg/utils"
@@ -295,6 +295,7 @@ func (a *APIStore) startTemplateBuildV2(c *gin.Context, templateID api.TemplateI
 		build.FreeDiskSizeMb, // Customer's free-space target after customer steps run.
 		build.RamMb,
 		build.MaxVcpu,
+		build.MaxRamMb,
 		body.ReadyCmd,
 		body.FromImage,
 		body.FromTemplate,
@@ -325,14 +326,10 @@ func (a *APIStore) startTemplateBuildV2(c *gin.Context, templateID api.TemplateI
 }
 
 // builderMinVersion is the oldest builder allowed to run the build. A builder
-// older than the gate drops maxVCpuCount and builds a fixed-size template, so a
-// resizable build must only go to one that honours it.
+// older than the gate drops maxVCpuCount or maxMemoryMB and builds a fixed-size
+// template, so a resizable build must only go to one that honours them.
 func builderMinVersion(build queries.EnvBuild) *semver.Version {
-	if build.MaxVcpu != nil {
-		return apiclusters.ResizableTemplateBuildsMinVersion
-	}
-
-	return nil
+	return apiclusters.TemplateBuilderMinVersion(build.MaxVcpu, build.MaxRamMb)
 }
 
 // userAgentToTemplateVersion returns the template semver version based on the user agent string.

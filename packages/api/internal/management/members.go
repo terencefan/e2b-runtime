@@ -8,8 +8,8 @@ import (
 
 	"github.com/google/uuid"
 
-	authqueries "github.com/e2b-dev/infra/packages/db/pkg/auth/queries"
-	"github.com/e2b-dev/infra/packages/db/pkg/dberrors"
+	authqueries "github.com/e2b-dev/infra/packages/api/internal/db/pkg/auth/queries"
+	"github.com/e2b-dev/infra/packages/shared/pkg/postgres/dberrors"
 )
 
 var (
@@ -27,6 +27,7 @@ type ProjectMemberIdentity struct {
 const (
 	ProjectMemberRoleOwner  = "owner"
 	ProjectMemberRoleMember = "member"
+	ProjectMemberRoleViewer = "viewer"
 )
 
 type ProjectMemberProjection struct {
@@ -146,7 +147,7 @@ func validateProjectMemberProjection(projection ProjectMemberProjection) error {
 		return ErrInvalidProjectMember
 	}
 	switch projection.Role {
-	case "", ProjectMemberRoleOwner, ProjectMemberRoleMember:
+	case "", ProjectMemberRoleOwner, ProjectMemberRoleMember, ProjectMemberRoleViewer:
 	default:
 		return ErrInvalidProjectMember
 	}

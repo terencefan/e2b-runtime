@@ -24,12 +24,12 @@ import (
 	"github.com/e2b-dev/infra/packages/api/internal/clusters"
 	"github.com/e2b-dev/infra/packages/api/internal/orchestrator/nodemanager"
 	"github.com/e2b-dev/infra/packages/api/internal/sandbox"
-	redisreservations "github.com/e2b-dev/infra/packages/api/internal/sandbox/reservations/redis"
-	sandboxredis "github.com/e2b-dev/infra/packages/api/internal/sandbox/storage/redis"
 	"github.com/e2b-dev/infra/packages/shared/pkg/consts"
 	"github.com/e2b-dev/infra/packages/shared/pkg/grpc/orchestrator"
 	infogrpc "github.com/e2b-dev/infra/packages/shared/pkg/grpc/orchestrator-info"
 	redis_utils "github.com/e2b-dev/infra/packages/shared/pkg/redis"
+	redisreservations "github.com/e2b-dev/infra/packages/shared/pkg/sandboxstore/reservations/redis"
+	sandboxredis "github.com/e2b-dev/infra/packages/shared/pkg/sandboxstore/storage/redis"
 	"github.com/e2b-dev/infra/packages/shared/pkg/servicediscovery"
 	"github.com/e2b-dev/infra/packages/shared/pkg/smap"
 	"github.com/e2b-dev/infra/packages/shared/pkg/telemetry"
@@ -39,27 +39,21 @@ func TestGetMaxTTLNormal(t *testing.T) {
 	t.Parallel()
 	now := time.Now()
 	ttl := getMaxAllowedTTL(now, now, 2*time.Hour, 3*time.Hour)
-	if ttl != 2*time.Hour {
-		t.Fatalf("expected 2 hours, got %v", ttl)
-	}
+	require.Equal(t, 2*time.Hour, ttl)
 }
 
 func TestGetMaxTTLMax(t *testing.T) {
 	t.Parallel()
 	now := time.Now()
 	ttl := getMaxAllowedTTL(now, now, 4*time.Hour, 3*time.Hour)
-	if ttl != 3*time.Hour {
-		t.Fatalf("expected 3 hours, got %v", ttl)
-	}
+	require.Equal(t, 3*time.Hour, ttl)
 }
 
 func TestGetMaxTTLExpired(t *testing.T) {
 	t.Parallel()
 	now := time.Now()
 	ttl := getMaxAllowedTTL(now, now.Add(-2*time.Hour), 4*time.Hour, time.Hour)
-	if ttl != 0 {
-		t.Fatalf("expected 0 hours, got %v", ttl)
-	}
+	require.Zero(t, ttl)
 }
 
 // The expiry sweep reads this index, so it is asserted alongside the record.
@@ -387,4 +381,32 @@ func TestKeepAliveFor_NodeInPoolExtends(t *testing.T) {
 	assert.Equal(t, int64(1), client.calls.Load())
 	assert.Equal(t, got.EndTime.UnixMilli(), client.appliedEnd.Load())
 	assert.Zero(t, discovery.calls.Load())
+}
+
+// Counted from the request's arrival, a timeout shorter than the wait for a
+// lifecycle hold would have expired the sandbox by the time it is answered.
+func TestKeepAliveFor_TimeoutCountsFromTheEndOfAHold(t *testing.T) {
+	t.Parallel()
+
+	rc := redis_utils.SetupInstance(t)
+	o := newKeepAliveReplica(t, rc, &countingDiscovery{})
+	addKeepAliveNode(o, "node-2", &keepAliveNodeClient{})
+	sbx := addKeepAliveSandbox(t, o, "node-2", time.Minute)
+	hold := sandbox.Hold{TeamID: sbx.TeamID, SandboxID: sbx.SandboxID, ExecutionID: sbx.ExecutionID, SourceNodeID: sbx.NodeID, ID: uuid.NewString()}
+	require.NoError(t, o.sandboxStore.HoldExecution(t.Context(), hold, time.Now().Add(time.Minute)))
+
+	released := make(chan time.Time, 1)
+	releaseErr := make(chan error, 1)
+	go func() {
+		// Lets the timeout request reach the held record first.
+		time.Sleep(100 * time.Millisecond)
+		released <- time.Now()
+		releaseErr <- o.sandboxStore.ReleaseHeldExecution(t.Context(), hold)
+	}()
+
+	const timeout = 10 * time.Second
+	got, apiErr := o.KeepAliveFor(t.Context(), sbx.TeamID, sbx.SandboxID, timeout, true)
+	require.NoError(t, <-releaseErr)
+	require.Nil(t, apiErr)
+	assert.False(t, got.EndTime.Before((<-released).Add(timeout)), "the timeout counts from when the hold ended")
 }

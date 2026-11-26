@@ -215,6 +215,18 @@ type Metrics struct {
 	// MemCache Cached memory (page cache) in bytes
 	MemCache int `json:"mem_cache,omitempty"`
 
+	// MemKernel Memory managed in the guest's other zones in bytes
+	MemKernel int64 `json:"mem_kernel,omitempty"`
+
+	// MemLimit Memory limit envd last applied to the user and PTY cgroups in bytes, recomputed whenever the guest's memory size changes; 0 when envd has applied none. A limit changed from inside the guest is not reflected.
+	MemLimit int64 `json:"mem_limit,omitempty"`
+
+	// MemMovable Memory managed in the guest's movable zone in bytes, the part a later memory unplug can reliably take back.
+	MemMovable int64 `json:"mem_movable,omitempty"`
+
+	// MemOnlinePolicy The guest kernel's memory_hotplug.online_policy, empty when the kernel has no such parameter.
+	MemOnlinePolicy string `json:"mem_online_policy,omitempty"`
+
 	// MemTotal Total virtual memory in bytes
 	MemTotal int `json:"mem_total,omitempty"`
 
@@ -367,6 +379,9 @@ type PostInitJSONBody struct {
 
 	// EnvVars Environment variables to set
 	EnvVars EnvVars `json:"envVars,omitempty"`
+
+	// ExposeLocalhostPorts Whether services listening only on loopback (127.0.0.1, localhost, ::1) are forwarded onto the sandbox's network interface, making them reachable through sandbox URLs. false kills every running forward and forwards nothing new; true forwards again from the next port scan. Absent keeps the current setting. A freshly booted guest forwards nothing until its first /init, then forwards unless told otherwise; an envd that restarts in the same boot keeps the setting.
+	ExposeLocalhostPorts *bool `json:"exposeLocalhostPorts,omitempty"`
 
 	// HyperloopIP IP address of the hyperloop server to connect to
 	HyperloopIP string `json:"hyperloopIP,omitempty"`

@@ -3,7 +3,6 @@ package handlers
 import (
 	"context"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -12,337 +11,44 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
+	"github.com/stretchr/testify/mock"
 	"github.com/stretchr/testify/require"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
+	"google.golang.org/protobuf/proto"
 
 	"github.com/e2b-dev/infra/packages/api/internal/api"
-	"github.com/e2b-dev/infra/packages/db/pkg/dberrors"
-	"github.com/e2b-dev/infra/packages/db/pkg/testutils"
-	dbtypes "github.com/e2b-dev/infra/packages/db/pkg/types"
-	"github.com/e2b-dev/infra/packages/db/queries"
+	"github.com/e2b-dev/infra/packages/api/internal/db/pkg/testutils"
+	dbtypes "github.com/e2b-dev/infra/packages/api/internal/db/pkg/types"
+	"github.com/e2b-dev/infra/packages/api/internal/db/queries"
+	"github.com/e2b-dev/infra/packages/shared/pkg/apierrors"
 	"github.com/e2b-dev/infra/packages/shared/pkg/consts"
+	clustersgrpc "github.com/e2b-dev/infra/packages/shared/pkg/grpc/contracts/clusters/management"
 )
 
-func TestManagementClusterLifecycleReplaysAndEndsAbsent(t *testing.T) {
-	t.Parallel()
-
-	db := testutils.SetupDatabase(t)
-	projectID := testutils.CreateTestTeam(t, db)
-	clusterID := uuid.New()
-	store, _ := newManagementStore(t, db)
-	registration := managementClusterRegistration()
-
-	for range 2 {
-		require.Equal(t, http.StatusNoContent, callManagementRegisterCluster(t, store, clusterID, registration).Code)
-	}
-	for range 2 {
-		require.Equal(t, http.StatusNoContent, callManagementAssignProjectCluster(t, store, projectID, clusterID).Code)
-	}
-	for range 2 {
-		require.Equal(t, http.StatusNoContent, callManagementDetachProjectCluster(t, store, projectID, clusterID).Code)
-	}
-	for range 2 {
-		require.Equal(t, http.StatusNoContent, callManagementDeleteCluster(t, store, clusterID).Code)
-	}
-
-	require.False(t, clusterExists(t, db, clusterID))
-}
-
-func TestManagementRegisterClusterRejectsIdentityChange(t *testing.T) {
-	t.Parallel()
-
-	db := testutils.SetupDatabase(t)
-	clusterID := uuid.New()
-	store, _ := newManagementStore(t, db)
-	registration := managementClusterRegistration()
-	require.Equal(t, http.StatusNoContent, callManagementRegisterCluster(t, store, clusterID, registration).Code)
-
-	for name, tc := range map[string]struct {
-		change func(*api.ManagementClusterRegistrationRequest)
-	}{
-		"auth organization":         {func(r *api.ManagementClusterRegistrationRequest) { r.AuthOrgId = new("changed-org") }},
-		"missing auth organization": {func(r *api.ManagementClusterRegistrationRequest) { r.AuthOrgId = nil }},
-	} {
-		t.Run(name, func(t *testing.T) {
-			t.Parallel()
-
-			changed := registration
-			changed.Token = "replacement-test-token"
-			tc.change(&changed)
-			response := callManagementRegisterCluster(t, store, clusterID, changed)
-			require.Equal(t, http.StatusConflict, response.Code, response.Body.String())
-			requireClusterErrorCode(t, response, clusterRegistrationConflictCode)
-		})
-	}
-}
-
-// A cluster that moves to a new domain registers its new endpoint and sandbox
-// domain under the same identity; its assignments and protection stay.
-func TestManagementRegisterClusterMovesConnectionDetails(t *testing.T) {
-	t.Parallel()
-
-	db := testutils.SetupDatabase(t)
-	projectID := testutils.CreateTestTeam(t, db)
-	clusterID := uuid.New()
-	store, _ := newManagementStore(t, db)
-	registration := managementClusterRegistration()
-	require.Equal(t, http.StatusNoContent, callManagementRegisterCluster(t, store, clusterID, registration).Code)
-	require.Equal(t, http.StatusNoContent, callManagementAssignProjectCluster(t, store, projectID, clusterID).Code)
-	require.NoError(t, db.SqlcClient.TestsRawSQL(t.Context(), `UPDATE public.clusters SET deletion_protection = true WHERE id = $1`, clusterID))
-
-	registration.Endpoint = "api.moved.example.test:443"
-	registration.SandboxProxyDomain = new("moved.example.test")
-	registration.EndpointTls = !registration.EndpointTls
-	for range 2 {
-		require.Equal(t, http.StatusNoContent, callManagementRegisterCluster(t, store, clusterID, registration).Code)
-	}
-
-	require.NoError(t, db.SqlcClient.TestsRawSQLQuery(t.Context(),
-		`SELECT c.endpoint, c.endpoint_tls, c.sandbox_proxy_domain, c.token, c.deletion_protection, t.cluster_id
-		FROM public.clusters c JOIN public.teams t ON t.cluster_id = c.id WHERE c.id = $1 AND t.id = $2`,
-		func(rows pgx.Rows) error {
-			require.True(t, rows.Next())
-			var endpoint, proxy, token string
-			var tls, protected bool
-			var assigned uuid.UUID
-			require.NoError(t, rows.Scan(&endpoint, &tls, &proxy, &token, &protected, &assigned))
-			require.Equal(t, registration.Endpoint, endpoint)
-			require.Equal(t, registration.EndpointTls, tls)
-			require.Equal(t, *registration.SandboxProxyDomain, proxy)
-			require.Equal(t, registration.Token, token)
-			require.True(t, protected)
-			require.Equal(t, clusterID, assigned)
-
-			return nil
-		}, clusterID, projectID))
-}
-
-func TestManagementRegisterClusterRefreshesOnlyToken(t *testing.T) {
-	t.Parallel()
-
-	db := testutils.SetupDatabase(t)
-	projectID := testutils.CreateTestTeam(t, db)
-	clusterID := uuid.New()
-	store, _ := newManagementStore(t, db)
-	registration := managementClusterRegistration()
-	registration.AuthOrgId = nil
-	require.Equal(t, http.StatusNoContent, callManagementRegisterCluster(t, store, clusterID, registration).Code)
-	require.Equal(t, http.StatusNoContent, callManagementAssignProjectCluster(t, store, projectID, clusterID).Code)
-	require.NoError(t, db.SqlcClient.TestsRawSQL(t.Context(), `UPDATE public.clusters SET deletion_protection = true WHERE id = $1`, clusterID))
-
-	registration.Token = "replacement-test-token"
-	for range 2 {
-		require.Equal(t, http.StatusNoContent, callManagementRegisterCluster(t, store, clusterID, registration).Code)
-	}
-
-	require.NoError(t, db.SqlcClient.TestsRawSQLQuery(t.Context(),
-		`SELECT c.token, c.deletion_protection, t.cluster_id
-		FROM public.clusters c JOIN public.teams t ON t.cluster_id = c.id WHERE c.id = $1 AND t.id = $2`,
-		func(rows pgx.Rows) error {
-			require.True(t, rows.Next())
-			var token string
-			var protected bool
-			var assigned uuid.UUID
-			require.NoError(t, rows.Scan(&token, &protected, &assigned))
-			require.Equal(t, registration.Token, token)
-			require.True(t, protected)
-			require.Equal(t, clusterID, assigned)
-
-			return nil
-		}, clusterID, projectID))
-
-	// Creation without a token refresh still rejects a credential change.
-	_, err := store.createCluster(t.Context(), clusterRegistration{
-		ClusterID: &clusterID, Name: registration.Name, Endpoint: registration.Endpoint,
-		EndpointTLS: registration.EndpointTls, Token: "another-test-token",
-		SandboxProxyDomain: registration.SandboxProxyDomain, AuthOrgID: registration.AuthOrgId,
-	})
-	require.Error(t, err)
-}
-
-func TestManagementRegisterClusterStartsUnprotected(t *testing.T) {
-	t.Parallel()
-
-	db := testutils.SetupDatabase(t)
-	clusterID := uuid.New()
-	store, _ := newManagementStore(t, db)
-
-	require.Equal(t, http.StatusNoContent, callManagementRegisterCluster(t, store, clusterID, managementClusterRegistration()).Code)
-
-	protected, err := db.SqlcClient.ClusterDeletionProtected(t.Context(), clusterID)
-	require.NoError(t, err)
-	require.False(t, protected)
-}
-
-func TestManagementRegisterClusterRejectsAnInvalidRegistration(t *testing.T) {
+func TestProjectReplacementAfterClusterRegistrationRemoval(t *testing.T) {
 	t.Parallel()
 
 	db := testutils.SetupDatabase(t)
 	store, _ := newManagementStore(t, db)
+	original, other := createCluster(t, db), createCluster(t, db)
+	project := newProjectFixture()
+	request := project.request()
+	request.ClusterId = &original
+	require.Equal(t, http.StatusCreated, callUpsertProject(t, store, project.id, request).Code)
 
-	for name, tc := range map[string]struct {
-		clusterID uuid.UUID
-		body      string
-	}{
-		"the local cluster's nil ID": {uuid.Nil, mustJSON(t, managementClusterRegistration())},
-		"a blank name":               {uuid.New(), `{"name":"  ","endpoint":"api.example.test:443","endpoint_tls":true,"token":"token"}`},
-		"a malformed body":           {uuid.New(), `{"name":`},
-	} {
-		t.Run(name, func(t *testing.T) {
-			t.Parallel()
+	removed := callManagement(t, store, http.MethodDelete, "/unstable/management/clusters/"+original.String()+"/registration", "")
+	require.Equal(t, http.StatusNoContent, removed.Code, removed.Body.String())
+	require.False(t, clusterExists(t, db, original))
+	request.ClusterId = &other
+	require.Equal(t, http.StatusConflict, callUpsertProject(t, store, project.id, request).Code)
+	require.Equal(t, &original, teamCluster(t, db, project.id))
 
-			response := callManagement(t, store, http.MethodPut, "/unstable/management/clusters/"+tc.clusterID.String(), tc.body)
-			require.Equal(t, http.StatusBadRequest, response.Code, response.Body.String())
-			requireClusterErrorCode(t, response, clusterRegistrationInvalidCode)
-			require.False(t, clusterExists(t, db, tc.clusterID))
-		})
-	}
-}
-
-func TestManagementAssignProjectClusterRejectsTheLocalCluster(t *testing.T) {
-	t.Parallel()
-
-	db := testutils.SetupDatabase(t)
-	projectID := testutils.CreateTestTeam(t, db)
-	store, auth := newManagementStore(t, db)
-
-	response := callManagementAssignProjectCluster(t, store, projectID, uuid.Nil)
-
-	require.Equal(t, http.StatusBadRequest, response.Code, response.Body.String())
-	requireClusterErrorCode(t, response, clusterAssignmentInvalidCode)
-	require.Empty(t, *auth.invalidatedTeamIDs)
-}
-
-func TestManagementAssignProjectClusterRejectsDifferentAssignment(t *testing.T) {
-	t.Parallel()
-
-	db := testutils.SetupDatabase(t)
-	projectID := testutils.CreateTestTeam(t, db)
-	firstID, secondID := uuid.New(), uuid.New()
-	store, auth := newManagementStore(t, db)
-	first := managementClusterRegistration()
-	second := managementClusterRegistration()
-	second.AuthOrgId = new("org_other")
-	require.Equal(t, http.StatusNoContent, callManagementRegisterCluster(t, store, firstID, first).Code)
-	require.Equal(t, http.StatusNoContent, callManagementRegisterCluster(t, store, secondID, second).Code)
-	require.Equal(t, http.StatusNoContent, callManagementAssignProjectCluster(t, store, projectID, firstID).Code)
-
-	response := callManagementAssignProjectCluster(t, store, projectID, secondID)
-
-	require.Equal(t, http.StatusConflict, response.Code, response.Body.String())
-	requireClusterErrorCode(t, response, clusterAssignmentAlreadyAssignedCode)
-	require.Equal(t, []uuid.UUID{projectID}, *auth.invalidatedTeamIDs)
-	require.Equal(t, firstID, assignedProjectCluster(t, db, projectID))
-}
-
-func TestManagementAssignProjectClusterAssignsAndEvictsTheProject(t *testing.T) {
-	t.Parallel()
-
-	db := testutils.SetupDatabase(t)
-	projectID := testutils.CreateTestTeam(t, db)
-	clusterID := uuid.New()
-	store, auth := newManagementStore(t, db)
-	require.Equal(t, http.StatusNoContent, callManagementRegisterCluster(t, store, clusterID, managementClusterRegistration()).Code)
-
-	response := callManagementAssignProjectCluster(t, store, projectID, clusterID)
-
-	require.Equal(t, http.StatusNoContent, response.Code, response.Body.String())
-	require.Equal(t, []uuid.UUID{projectID}, *auth.invalidatedTeamIDs)
-	require.Equal(t, clusterID, assignedProjectCluster(t, db, projectID))
-}
-
-func TestManagementAssignmentMissingResourcesHaveStableCodes(t *testing.T) {
-	t.Parallel()
-
-	db := testutils.SetupDatabase(t)
-	projectID := testutils.CreateTestTeam(t, db)
-	store, _ := newManagementStore(t, db)
-
-	for name, tc := range map[string]struct {
-		projectID uuid.UUID
-		code      string
-	}{
-		"project": {uuid.New(), clusterAssignmentProjectNotFoundCode},
-		"cluster": {projectID, clusterAssignmentClusterNotFoundCode},
-	} {
-		t.Run(name, func(t *testing.T) {
-			t.Parallel()
-
-			response := callManagementAssignProjectCluster(t, store, tc.projectID, uuid.New())
-			require.Equal(t, http.StatusNotFound, response.Code, response.Body.String())
-			requireClusterErrorCode(t, response, tc.code)
-		})
-	}
-}
-
-func TestManagementDetachProjectClusterRefusesADifferentCluster(t *testing.T) {
-	t.Parallel()
-
-	db := testutils.SetupDatabase(t)
-	projectID := testutils.CreateTestTeam(t, db)
-	clusterID := uuid.New()
-	store, auth := newManagementStore(t, db)
-	require.Equal(t, http.StatusNoContent, callManagementRegisterCluster(t, store, clusterID, managementClusterRegistration()).Code)
-	require.Equal(t, http.StatusNoContent, callManagementAssignProjectCluster(t, store, projectID, clusterID).Code)
-
-	response := callManagementDetachProjectCluster(t, store, projectID, uuid.New())
-
-	require.Equal(t, http.StatusConflict, response.Code, response.Body.String())
-	require.Equal(t, clusterID, assignedProjectCluster(t, db, projectID))
-	require.Equal(t, []uuid.UUID{projectID}, *auth.invalidatedTeamIDs, "only the assignment evicted the team")
-}
-
-func TestManagementDetachProjectClusterAnswersNotFoundForAMissingProject(t *testing.T) {
-	t.Parallel()
-
-	db := testutils.SetupDatabase(t)
-	store, auth := newManagementStore(t, db)
-
-	response := callManagementDetachProjectCluster(t, store, uuid.New(), uuid.New())
-
-	require.Equal(t, http.StatusNotFound, response.Code, response.Body.String())
-	require.Empty(t, *auth.invalidatedTeamIDs)
-}
-
-// The assignment is stored before the eviction, so a failed eviction answers
-// 500 and the caller's retry, which replays the identical write, evicts again.
-func TestManagementClusterAssignmentReportsAFailedCacheEviction(t *testing.T) {
-	t.Parallel()
-
-	db := testutils.SetupDatabase(t)
-	clusterID := uuid.New()
-	setup, _ := newManagementStore(t, db)
-	require.Equal(t, http.StatusNoContent, callManagementRegisterCluster(t, setup, clusterID, managementClusterRegistration()).Code)
-
-	for name, tc := range map[string]struct {
-		call         func(*testing.T, *APIStore, uuid.UUID, uuid.UUID) *httptest.ResponseRecorder
-		wantAssigned bool
-	}{
-		"assignment": {callManagementAssignProjectCluster, true},
-		"detachment": {callManagementDetachProjectCluster, false},
-	} {
-		t.Run(name, func(t *testing.T) {
-			t.Parallel()
-
-			projectID := testutils.CreateTestTeam(t, db)
-			require.NoError(t, db.SqlcClient.TestsRawSQL(t.Context(), `UPDATE public.teams SET cluster_id = $1 WHERE id = $2 AND $3`,
-				clusterID, projectID, !tc.wantAssigned))
-			store, auth := newManagementStore(t, db)
-			auth.invalidateTeamErr = errors.New("cache unavailable")
-
-			response := tc.call(t, store, projectID, clusterID)
-
-			require.Equal(t, http.StatusInternalServerError, response.Code, response.Body.String())
-			require.Equal(t, []uuid.UUID{projectID}, *auth.invalidatedTeamIDs)
-			var assigned *uuid.UUID
-			require.NoError(t, db.SqlcClient.TestsRawSQLQuery(t.Context(), `SELECT cluster_id FROM public.teams WHERE id = $1`,
-				func(rows pgx.Rows) error {
-					require.True(t, rows.Next())
-
-					return rows.Scan(&assigned)
-				}, projectID))
-			require.Equal(t, tc.wantAssigned, assigned != nil, "the write is kept")
-		})
-	}
+	require.Equal(t, http.StatusNoContent, callDeleteProject(t, store, project.id).Code)
+	require.Equal(t, http.StatusNotFound, callUpsertProject(t, store, project.id, request).Code)
+	replacement := uuid.New()
+	require.Equal(t, http.StatusCreated, callUpsertProject(t, store, replacement, request).Code)
+	require.Equal(t, &other, teamCluster(t, db, replacement))
 }
 
 func TestManagementDeleteClusterSoftDeletesItsEnvironmentsWhenNoTeamIsAssigned(t *testing.T) {
@@ -376,8 +82,7 @@ func TestManagementDeleteClusterSoftDeletesItsEnvironmentsWhenNoTeamIsAssigned(t
 			_, err := db.SqlcClient.SoftDeleteTemplate(ctx, queries.SoftDeleteTemplateParams{TemplateID: deletedID, TeamID: teamID})
 			require.NoError(t, err)
 			if teamAssigned {
-				_, err := db.SqlcClient.AssignTeamCluster(ctx, queries.AssignTeamClusterParams{TeamID: teamID, ClusterID: clusterID})
-				require.NoError(t, err)
+				putTeamOnCluster(t, db, teamID, clusterID)
 			}
 			store, _ := newManagementStore(t, db)
 
@@ -410,31 +115,33 @@ func TestManagementDeleteClusterSoftDeletesItsEnvironmentsWhenNoTeamIsAssigned(t
 				require.Equal(t, http.StatusNoContent, callManagementDeleteCluster(t, store, clusterID).Code)
 			}
 			wantJSON, err := json.Marshal(map[string]any{
-				"cluster_exists": teamAssigned,
-				"envs":           wantEnvs,
-				"aliases":        wantReferences,
-				"active_builds":  wantReferences,
+				"envs":          wantEnvs,
+				"aliases":       wantReferences,
+				"active_builds": wantReferences,
 			})
 			require.NoError(t, err)
 			var state string
 			require.NoError(t, db.SqlcClient.TestsRawSQLQuery(ctx, `SELECT jsonb_build_object(
-				'cluster_exists', EXISTS (SELECT FROM public.clusters WHERE id = $1),
 				'envs', (SELECT jsonb_object_agg(id, jsonb_build_object('cluster', cluster_id, 'deleted', deleted_at IS NOT NULL))
-					FROM public.envs WHERE id = ANY($2::text[])),
-				'aliases', (SELECT count(*) FROM public.env_aliases WHERE env_id = $3),
-				'active_builds', (SELECT count(*) FROM public.active_template_builds WHERE template_id = $3))::text`,
+					FROM public.envs WHERE id = ANY($1::text[])),
+				'aliases', (SELECT count(*) FROM public.env_aliases WHERE env_id = $2),
+				'active_builds', (SELECT count(*) FROM public.active_template_builds WHERE template_id = $2))::text`,
 				func(rows pgx.Rows) error {
 					require.True(t, rows.Next())
 
 					return rows.Scan(&state)
-				}, clusterID, []string{deletedID, activeID, snapshotID, otherID, localID}, activeID))
+				}, []string{deletedID, activeID, snapshotID, otherID, localID}, activeID))
 			require.JSONEq(t, string(wantJSON), state)
+			require.Equal(t, teamAssigned, clusterExists(t, db, clusterID))
 			require.True(t, testutils.GetEnvBuildByID(t, ctx, db, buildID), "build history must survive")
 		})
 	}
 }
 
-func TestManagementDeleteClusterWaitsForAConcurrentTeamReference(t *testing.T) {
+// The cluster service records the deletion before it refuses or fails the
+// removal, so the cluster stays refused to new teams after the API releases
+// its lock; the templates are restored for the retry.
+func TestAClusterDeleteTheServiceRefusesKeepsTheTemplatesAndTheRecordedDeletion(t *testing.T) {
 	t.Parallel()
 
 	db := testutils.SetupDatabase(t)
@@ -442,33 +149,31 @@ func TestManagementDeleteClusterWaitsForAConcurrentTeamReference(t *testing.T) {
 	teamID := testutils.CreateTestTeam(t, db)
 	clusterID := uuid.New()
 	insertCluster(t, db, clusterID, false)
-
-	referenceClient, referenceTx, err := db.SqlcClient.WithTx(ctx)
-	require.NoError(t, err)
-	defer func() { _ = referenceTx.Rollback(context.WithoutCancel(ctx)) }()
-	result, err := referenceClient.AssignTeamCluster(ctx, queries.AssignTeamClusterParams{TeamID: teamID, ClusterID: clusterID})
-	require.NoError(t, err)
-	require.True(t, result.Assigned)
-
+	templateID := testutils.CreateTestTemplate(t, db, teamID)
+	require.NoError(t, db.SqlcClient.TestsRawSQL(ctx, `UPDATE public.envs SET cluster_id = $2 WHERE id = $1`, templateID, clusterID))
 	store, _ := newManagementStore(t, db)
-	responseCh := make(chan *httptest.ResponseRecorder, 1)
-	go func() { responseCh <- callManagementDeleteCluster(t, store, clusterID) }()
-	waitForBlockedQuery(t, db, "%DELETE FROM public.clusters%")
+	clusterService := newSingleClusterService(t, clusterID, clusterPresent)
+	clusterService.EXPECT().DeleteCluster(mock.Anything, mock.Anything).Return(nil, clusterRefusal(clustersgrpc.ClusterErrorReason_CLUSTER_ERROR_REASON_IN_USE)).Once()
+	withClusterService(t, db, store, clusterService)
 
-	select {
-	case response := <-responseCh:
-		require.FailNow(t, "cluster deletion returned before the team reference committed", response.Body.String())
-	default:
-	}
-	require.NoError(t, referenceTx.Commit(ctx))
+	response := callManagementDeleteCluster(t, store, clusterID)
 
-	select {
-	case response := <-responseCh:
-		require.Equal(t, http.StatusConflict, response.Code, response.Body.String())
-	case <-time.After(5 * time.Second):
-		require.FailNow(t, "cluster deletion did not finish after the team reference committed")
-	}
-	require.Equal(t, clusterID, assignedProjectCluster(t, db, teamID))
+	require.Equal(t, http.StatusConflict, response.Code, response.Body.String())
+	require.Empty(t, response.Header().Get(apierrors.ShouldRetryHeader))
+	var deleted bool
+	require.NoError(t, db.SqlcClient.TestsRawSQLQuery(ctx, `SELECT deleted_at IS NOT NULL FROM public.envs WHERE id = $1`,
+		func(rows pgx.Rows) error {
+			require.True(t, rows.Next())
+
+			return rows.Scan(&deleted)
+		}, templateID))
+	require.False(t, deleted)
+	late := newProjectFixture()
+	onCluster := late.request()
+	onCluster.ClusterId = &clusterID
+	refused := callUpsertProject(t, store, late.id, onCluster)
+	require.Equal(t, http.StatusConflict, refused.Code, refused.Body.String())
+	require.Contains(t, refused.Body.String(), "Cluster is being deleted")
 }
 
 func TestManagementDeleteClusterReleasesRowsARacingRegistrationCommits(t *testing.T) {
@@ -510,7 +215,7 @@ func TestManagementDeleteClusterReleasesRowsARacingRegistrationCommits(t *testin
 	case response := <-responseCh:
 		require.Equal(t, http.StatusNoContent, response.Code, response.Body.String())
 	case <-time.After(5 * time.Second):
-		require.FailNow(t, "cluster deletion did not finish after the registration committed")
+		require.Fail(t, "cluster deletion did not finish after the registration committed")
 	}
 	var state string
 	require.NoError(t, db.SqlcClient.TestsRawSQLQuery(ctx, `SELECT jsonb_build_object(
@@ -560,94 +265,91 @@ func TestManagementDeleteClusterRefusesAProtectedCluster(t *testing.T) {
 	db := testutils.SetupDatabase(t)
 	ctx := t.Context()
 	clusterID := uuid.New()
-	registration := managementClusterRegistration()
-	require.NoError(t, db.SqlcClient.TestsRawSQL(ctx,
-		`INSERT INTO public.clusters (id, name, endpoint, endpoint_tls, token, sandbox_proxy_domain, auth_org_id, deletion_protection)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, true)`,
-		clusterID, registration.Name, registration.Endpoint, registration.EndpointTls, registration.Token,
-		*registration.SandboxProxyDomain, *registration.AuthOrgId))
+	insertCluster(t, db, clusterID, true)
 	teamID := testutils.CreateTestTeam(t, db)
 	templateID := testutils.CreateTestTemplate(t, db, teamID)
 	require.NoError(t, db.SqlcClient.TestsRawSQL(ctx, `UPDATE public.envs SET cluster_id = $2 WHERE id = $1`, templateID, clusterID))
 	store, _ := newManagementStore(t, db)
-	// Registering the same cluster through the management API, which creates
-	// new clusters unprotected, must keep the stored protection.
-	require.Equal(t, http.StatusNoContent, callManagementRegisterCluster(t, store, clusterID, registration).Code)
 
 	response := callManagementDeleteCluster(t, store, clusterID)
 
 	require.Equal(t, http.StatusConflict, response.Code, response.Body.String())
 	require.JSONEq(t, `{"code":409,"message":"Cluster has deletion protection turned on"}`, response.Body.String())
-	var protectedAndIntact bool
-	require.NoError(t, db.SqlcClient.TestsRawSQLQuery(ctx, `SELECT
-		EXISTS (SELECT FROM public.clusters WHERE id = $1 AND deletion_protection)
-		AND EXISTS (SELECT FROM public.envs WHERE id = $2 AND cluster_id = $1 AND deleted_at IS NULL)`,
+	stored, ok := recordsOf(db).get(clusterID)
+	require.True(t, ok)
+	require.True(t, stored.GetDeletionProtection())
+	var intact bool
+	require.NoError(t, db.SqlcClient.TestsRawSQLQuery(ctx,
+		`SELECT EXISTS (SELECT FROM public.envs WHERE id = $1 AND cluster_id = $2 AND deleted_at IS NULL)`,
 		func(rows pgx.Rows) error {
 			require.True(t, rows.Next())
 
-			return rows.Scan(&protectedAndIntact)
-		}, clusterID, templateID))
-	require.True(t, protectedAndIntact)
+			return rows.Scan(&intact)
+		}, templateID, clusterID))
+	require.True(t, intact)
 }
 
-func TestManagementClusterDeletionRequestKeepsProtectionOff(t *testing.T) {
+func TestManagementRequestClusterDeletion(t *testing.T) {
 	t.Parallel()
 
 	db := testutils.SetupDatabase(t)
-	store, _ := newManagementStore(t, db)
-	ctx := t.Context()
-	conn, err := pgx.Connect(ctx, db.ConnStr())
-	require.NoError(t, err)
-	t.Cleanup(func() { _ = conn.Close(context.WithoutCancel(ctx)) })
-	unprotected, protected := uuid.New(), uuid.New()
-	insertCluster(t, db, unprotected, false)
-	insertCluster(t, db, protected, true)
+	for name, tc := range map[string]struct {
+		answer error
+		want   int
+	}{
+		"an unprotected cluster":                   {nil, http.StatusNoContent},
+		"an absent cluster has nothing to protect": {status.Error(codes.NotFound, "cluster not found"), http.StatusNoContent},
+		"a protected cluster": {
+			clusterRefusal(clustersgrpc.ClusterErrorReason_CLUSTER_ERROR_REASON_DELETION_PROTECTED), http.StatusConflict,
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
 
-	require.Equal(t, http.StatusNoContent, callManagementRequestClusterDeletion(t, store, unprotected))
-	require.Equal(t, http.StatusNoContent, callManagementRequestClusterDeletion(t, store, unprotected), "a repeat succeeds")
-	var requested bool
-	require.NoError(t, conn.QueryRow(ctx, `SELECT deletion_requested_at IS NOT NULL FROM public.clusters WHERE id = $1`, unprotected).Scan(&requested))
-	require.True(t, requested)
-	_, err = conn.Exec(ctx, `UPDATE public.clusters SET deletion_protection = true WHERE id = $1`, unprotected)
-	require.ErrorContains(t, err, "clusters_deletion_requested_unprotected", "a requested deletion keeps protection off")
+			clusterID := uuid.New()
+			want := clustersgrpc.UpdateClusterRequest_builder{ClusterId: clusterID.String(), RequestDeletion: true}.Build()
+			store, clusterService := newClusterServiceStore(t)
+			store.sqlcDB = db.SqlcClient
+			var answer *clustersgrpc.UpdateClusterResponse
+			if tc.answer == nil {
+				answer = clustersgrpc.UpdateClusterResponse_builder{Cluster: clustersgrpc.Cluster_builder{ClusterId: clusterID.String()}.Build()}.Build()
+			}
+			clusterService.EXPECT().UpdateCluster(mock.Anything, mock.MatchedBy(func(req *clustersgrpc.UpdateClusterRequest) bool {
+				return proto.Equal(want, req)
+			})).Return(answer, tc.answer).Once()
 
-	require.Equal(t, http.StatusConflict, callManagementRequestClusterDeletion(t, store, protected))
-	require.NoError(t, conn.QueryRow(ctx, `SELECT deletion_requested_at IS NOT NULL FROM public.clusters WHERE id = $1`, protected).Scan(&requested))
-	require.False(t, requested)
+			require.Equal(t, tc.want, callManagementRequestClusterDeletion(t, store, clusterID))
+		})
+	}
 
-	require.Equal(t, http.StatusNoContent, callManagementRequestClusterDeletion(t, store, uuid.New()), "an absent cluster has nothing to protect")
-	require.Equal(t, http.StatusBadRequest, callManagementRequestClusterDeletion(t, store, consts.LocalClusterID))
+	t.Run("the local cluster", func(t *testing.T) {
+		t.Parallel()
+
+		store, _ := newClusterServiceStore(t)
+		require.Equal(t, http.StatusBadRequest, callManagementRequestClusterDeletion(t, store, consts.LocalClusterID))
+	})
 }
 
-func TestManagementClusterDeletionRequestWaitsForAProtectionChangeInFlight(t *testing.T) {
+func TestClusterDeletionIsRetryableWhenTheMarkerCannotBeRecorded(t *testing.T) {
 	t.Parallel()
 
 	db := testutils.SetupDatabase(t)
-	store, _ := newManagementStore(t, db)
-	ctx := t.Context()
 	clusterID := uuid.New()
-	insertCluster(t, db, clusterID, false)
+	store, service := newClusterServiceStore(t)
+	store.sqlcDB = db.SqlcClient
+	service.EXPECT().GetCluster(mock.Anything, mock.Anything).Return(clustersgrpc.GetClusterResponse_builder{
+		Cluster: clustersgrpc.Cluster_builder{ClusterId: clusterID.String()}.Build(),
+	}.Build(), nil).Once()
+	service.EXPECT().UpdateCluster(mock.Anything, mock.MatchedBy(isDeletionRequest)).Return(nil, status.Error(codes.Unavailable, "retry later")).Twice()
 
-	protecting, err := pgx.Connect(ctx, db.ConnStr())
-	require.NoError(t, err)
-	t.Cleanup(func() { _ = protecting.Close(context.WithoutCancel(ctx)) })
-	tx, err := protecting.Begin(ctx)
-	require.NoError(t, err)
-	defer func() { _ = tx.Rollback(context.WithoutCancel(ctx)) }()
-	_, err = tx.Exec(ctx, `UPDATE public.clusters SET deletion_protection = true WHERE id = $1`, clusterID)
-	require.NoError(t, err)
-	var protectingPID int
-	require.NoError(t, tx.QueryRow(ctx, `SELECT pg_backend_pid()`).Scan(&protectingPID))
-
-	status := make(chan int, 1)
-	go func() { status <- callManagementRequestClusterDeletion(t, store, clusterID) }()
-	waitForBlockedBy(t, db, protectingPID)
-	require.NoError(t, tx.Commit(ctx))
-
-	require.Equal(t, http.StatusConflict, <-status)
-	var requested bool
-	require.NoError(t, protecting.QueryRow(ctx, `SELECT deletion_requested_at IS NOT NULL FROM public.clusters WHERE id = $1`, clusterID).Scan(&requested))
-	require.False(t, requested)
+	path := "/unstable/management/clusters/" + clusterID.String()
+	for _, res := range []*httptest.ResponseRecorder{
+		callManagement(t, store, http.MethodPut, path+"/deletion", ""),
+		callManagementDeleteCluster(t, store, clusterID),
+	} {
+		require.Equal(t, http.StatusServiceUnavailable, res.Code, res.Body.String())
+		require.Equal(t, "true", res.Header().Get(apierrors.ShouldRetryHeader))
+	}
 }
 
 func TestManagementListClusterProjectsListsLiveAssignments(t *testing.T) {
@@ -656,74 +358,14 @@ func TestManagementListClusterProjectsListsLiveAssignments(t *testing.T) {
 	db := testutils.SetupDatabase(t)
 	store, _ := newManagementStore(t, db)
 	clusterID := uuid.New()
-	require.Equal(t, http.StatusNoContent, callManagementRegisterCluster(t, store, clusterID, managementClusterRegistration()).Code)
-	assigned, detached := testutils.CreateTestTeam(t, db), testutils.CreateTestTeam(t, db)
+	insertCluster(t, db, clusterID, false)
+	assigned := assignTeam(t, db, clusterID)
 	testutils.CreateTestTeam(t, db)
-	for _, projectID := range []uuid.UUID{assigned, detached} {
-		require.Equal(t, http.StatusNoContent, callManagementAssignProjectCluster(t, store, projectID, clusterID).Code)
-	}
-	require.Equal(t, http.StatusNoContent, callManagementDetachProjectCluster(t, store, detached, clusterID).Code)
 
 	require.Equal(t, []uuid.UUID{assigned}, listClusterProjects(t, store, clusterID))
 	absent := listClusterProjects(t, store, uuid.New())
 	require.NotNil(t, absent, "an absent cluster lists no projects, not null")
 	require.Empty(t, absent)
-}
-
-func TestNoTeamIsNewlyAssignedToAClusterBeingDeleted(t *testing.T) {
-	t.Parallel()
-
-	db := testutils.SetupDatabase(t)
-	store, _ := newManagementStore(t, db)
-	ctx := t.Context()
-	clusterID := uuid.New()
-	require.Equal(t, http.StatusNoContent, callManagementRegisterCluster(t, store, clusterID, managementClusterRegistration()).Code)
-	assigned, late, raw := testutils.CreateTestTeam(t, db), testutils.CreateTestTeam(t, db), testutils.CreateTestTeam(t, db)
-	require.Equal(t, http.StatusNoContent, callManagementAssignProjectCluster(t, store, assigned, clusterID).Code)
-	require.Equal(t, http.StatusNoContent, callManagementRequestClusterDeletion(t, store, clusterID))
-
-	refused := callManagementAssignProjectCluster(t, store, late, clusterID)
-	require.Equal(t, http.StatusConflict, refused.Code, refused.Body.String())
-	requireClusterErrorCode(t, refused, clusterAssignmentClusterDeletingCode)
-	require.Equal(t, http.StatusNoContent, callManagementAssignProjectCluster(t, store, assigned, clusterID).Code, "an existing assignment is not a new one")
-
-	err := db.SqlcClient.TestsRawSQL(ctx, `UPDATE public.teams SET cluster_id = $1 WHERE id = $2`, clusterID, raw)
-	require.Equal(t, clusterDeletingConstraint, dberrors.ConstraintName(err), "every writer of a team's cluster is refused")
-	require.Equal(t, []uuid.UUID{assigned}, listClusterProjects(t, store, clusterID))
-}
-
-func TestAnAssignmentWaitsForADeletionRequestInFlight(t *testing.T) {
-	t.Parallel()
-
-	db := testutils.SetupDatabase(t)
-	store, _ := newManagementStore(t, db)
-	ctx := t.Context()
-	clusterID := uuid.New()
-	require.Equal(t, http.StatusNoContent, callManagementRegisterCluster(t, store, clusterID, managementClusterRegistration()).Code)
-	team := testutils.CreateTestTeam(t, db)
-
-	deleting, err := pgx.Connect(ctx, db.ConnStr())
-	require.NoError(t, err)
-	t.Cleanup(func() { _ = deleting.Close(context.WithoutCancel(ctx)) })
-	tx, err := deleting.Begin(ctx)
-	require.NoError(t, err)
-	defer func() { _ = tx.Rollback(context.WithoutCancel(ctx)) }()
-	_, err = tx.Exec(ctx, `SELECT deletion_protection FROM public.clusters WHERE id = $1 FOR UPDATE`, clusterID)
-	require.NoError(t, err)
-	_, err = tx.Exec(ctx, `UPDATE public.clusters SET deletion_requested_at = now() WHERE id = $1`, clusterID)
-	require.NoError(t, err)
-	var deletingPID int
-	require.NoError(t, tx.QueryRow(ctx, `SELECT pg_backend_pid()`).Scan(&deletingPID))
-
-	status := make(chan int, 1)
-	go func() { status <- callManagementAssignProjectCluster(t, store, team, clusterID).Code }()
-	waitForBlockedBy(t, db, deletingPID)
-	require.NoError(t, tx.Commit(ctx))
-
-	require.Equal(t, http.StatusConflict, <-status)
-	var assigned *uuid.UUID
-	require.NoError(t, deleting.QueryRow(ctx, `SELECT cluster_id FROM public.teams WHERE id = $1`, team).Scan(&assigned))
-	require.Nil(t, assigned)
 }
 
 func TestATeamDeletedBeforeDeletionClearedItsClusterNeitherListsNorBlocks(t *testing.T) {
@@ -733,9 +375,8 @@ func TestATeamDeletedBeforeDeletionClearedItsClusterNeitherListsNorBlocks(t *tes
 	store, _ := newManagementStore(t, db)
 	ctx := t.Context()
 	clusterID := uuid.New()
-	require.Equal(t, http.StatusNoContent, callManagementRegisterCluster(t, store, clusterID, managementClusterRegistration()).Code)
-	deleted := testutils.CreateTestTeam(t, db)
-	require.Equal(t, http.StatusNoContent, callManagementAssignProjectCluster(t, store, deleted, clusterID).Code)
+	insertCluster(t, db, clusterID, false)
+	deleted := assignTeam(t, db, clusterID)
 	require.NoError(t, db.SqlcClient.TestsRawSQL(ctx,
 		`UPDATE public.teams SET deleted_at = now(), is_blocked = true, blocked_reason = 'Project deletion' WHERE id = $1`, deleted))
 
@@ -763,10 +404,8 @@ func TestClusterDestroyReadinessRefusesOnlySharedClustersWithoutMutation(t *test
 	for _, clusterID := range []uuid.UUID{ownCluster, foreignEnvCluster, sharedCluster, orphanCluster, historyCluster} {
 		insertCluster(t, db, clusterID, false)
 	}
-	// Created without a protection value, so it takes the column default.
 	protectedCluster := uuid.New()
-	require.NoError(t, db.SqlcClient.TestsRawSQL(ctx,
-		`INSERT INTO public.clusters (id, name, endpoint, endpoint_tls, token) VALUES ($1::uuid, $1::uuid::text, $1::uuid::text, true, 'secret-token')`, protectedCluster))
+	insertCluster(t, db, protectedCluster, true)
 	for _, assignment := range []struct {
 		teamID, clusterID uuid.UUID
 	}{
@@ -801,20 +440,20 @@ func TestClusterDestroyReadinessRefusesOnlySharedClustersWithoutMutation(t *test
 
 		var state string
 		require.NoError(t, db.SqlcClient.TestsRawSQLQuery(t.Context(), `SELECT jsonb_build_object(
-			'clusters', (SELECT jsonb_agg(to_jsonb(c) ORDER BY id) FROM public.clusters c),
+			'clusters', $1::jsonb,
 			'teams', (SELECT jsonb_agg(to_jsonb(t) ORDER BY id) FROM public.teams t),
 			'envs', (SELECT jsonb_agg(to_jsonb(e) ORDER BY id) FROM public.envs e))::text`,
 			func(rows pgx.Rows) error {
 				require.True(t, rows.Next())
 
 				return rows.Scan(&state)
-			}))
+			}, recordedClustersJSON(t, db)))
 
 		return state
 	}
 	before := readState(t)
 	store, _ := newManagementStore(t, db)
-	const sharedClusterMessage = "Cluster is used by more than one team. Move the other teams and their templates off it before destroying the deployment."
+	const sharedClusterMessage = "Cluster is used by more than one team and cannot be destroyed."
 
 	for name, tc := range map[string]struct {
 		clusterID uuid.UUID
@@ -847,23 +486,6 @@ func TestClusterDestroyReadinessRefusesOnlySharedClustersWithoutMutation(t *test
 	}
 }
 
-func managementClusterRegistration() api.ManagementClusterRegistrationRequest {
-	return api.ManagementClusterRegistrationRequest{
-		Name:               "Managed cluster",
-		Endpoint:           "api.example.test:443",
-		EndpointTls:        true,
-		Token:              "cluster-token",
-		SandboxProxyDomain: new("sandbox.example.test"),
-		AuthOrgId:          new("org_example"),
-	}
-}
-
-func callManagementRegisterCluster(t *testing.T, store *APIStore, clusterID uuid.UUID, registration api.ManagementClusterRegistrationRequest) *httptest.ResponseRecorder {
-	t.Helper()
-
-	return callManagement(t, store, http.MethodPut, "/unstable/management/clusters/"+clusterID.String(), mustJSON(t, registration))
-}
-
 func callManagementDeleteCluster(t *testing.T, store *APIStore, clusterID uuid.UUID) *httptest.ResponseRecorder {
 	t.Helper()
 
@@ -874,18 +496,6 @@ func callManagementRequestClusterDeletion(t *testing.T, store *APIStore, cluster
 	t.Helper()
 
 	return callManagement(t, store, http.MethodPut, "/unstable/management/clusters/"+clusterID.String()+"/deletion", "").Code
-}
-
-func callManagementAssignProjectCluster(t *testing.T, store *APIStore, projectID, clusterID uuid.UUID) *httptest.ResponseRecorder {
-	t.Helper()
-
-	return callManagement(t, store, http.MethodPut, "/unstable/management/projects/"+projectID.String()+"/cluster/"+clusterID.String(), "")
-}
-
-func callManagementDetachProjectCluster(t *testing.T, store *APIStore, projectID, clusterID uuid.UUID) *httptest.ResponseRecorder {
-	t.Helper()
-
-	return callManagement(t, store, http.MethodDelete, "/unstable/management/projects/"+projectID.String()+"/cluster/"+clusterID.String(), "")
 }
 
 func listClusterProjects(t *testing.T, store *APIStore, clusterID uuid.UUID) []uuid.UUID {
@@ -899,50 +509,10 @@ func listClusterProjects(t *testing.T, store *APIStore, clusterID uuid.UUID) []u
 	return projects.ProjectIds
 }
 
-func requireClusterErrorCode(t *testing.T, response *httptest.ResponseRecorder, code string) {
+func putTeamOnCluster(t *testing.T, db *testutils.Database, teamID, clusterID uuid.UUID) {
 	t.Helper()
 
-	var body api.Error
-	require.NoError(t, json.Unmarshal(response.Body.Bytes(), &body))
-	require.NotNil(t, body.ErrorCode)
-	require.Equal(t, code, *body.ErrorCode)
-	require.EqualValues(t, response.Code, body.Code)
-}
-
-func insertCluster(t *testing.T, db *testutils.Database, clusterID uuid.UUID, protected bool) {
-	t.Helper()
-
-	require.NoError(t, db.SqlcClient.TestsRawSQL(t.Context(),
-		`INSERT INTO public.clusters (id, name, endpoint, endpoint_tls, token, deletion_protection)
-		VALUES ($1::uuid, $1::uuid::text, $1::uuid::text, true, 'token', $2)`, clusterID, protected))
-}
-
-func clusterExists(t *testing.T, db *testutils.Database, clusterID uuid.UUID) bool {
-	t.Helper()
-
-	var exists bool
-	require.NoError(t, db.SqlcClient.TestsRawSQLQuery(t.Context(), `SELECT EXISTS (SELECT FROM public.clusters WHERE id = $1)`,
-		func(rows pgx.Rows) error {
-			require.True(t, rows.Next())
-
-			return rows.Scan(&exists)
-		}, clusterID))
-
-	return exists
-}
-
-func assignedProjectCluster(t *testing.T, db *testutils.Database, projectID uuid.UUID) uuid.UUID {
-	t.Helper()
-
-	var clusterID uuid.UUID
-	require.NoError(t, db.SqlcClient.TestsRawSQLQuery(t.Context(), `SELECT cluster_id FROM public.teams WHERE id = $1`,
-		func(rows pgx.Rows) error {
-			require.True(t, rows.Next())
-
-			return rows.Scan(&clusterID)
-		}, projectID))
-
-	return clusterID
+	require.NoError(t, db.SqlcClient.TestsRawSQL(t.Context(), `UPDATE public.teams SET cluster_id = $1 WHERE id = $2`, clusterID, teamID))
 }
 
 // waitForBlockedQuery waits until a statement matching the LIKE pattern waits
@@ -995,29 +565,4 @@ func mustJSON(t *testing.T, value any) string {
 	require.NoError(t, err)
 
 	return string(body)
-}
-
-func TestRegistrationProjectsUniqueTelemetryClientIdentity(t *testing.T) {
-	t.Parallel()
-	db := testutils.SetupDatabase(t)
-	store := newAdminClusterStore(db)
-	clusterID := uuid.New()
-	registration := managementClusterRegistration()
-	registration.TelemetryClientId = new("client_first")
-	require.Equal(t, http.StatusNoContent, callManagementRegisterCluster(t, store, clusterID, registration).Code)
-	rows, err := db.SqlcClient.ListTelemetryNames(t.Context())
-	require.NoError(t, err)
-	require.Contains(t, rows, queries.ListTelemetryNamesRow{Kind: "cluster", ID: clusterID.String(), Name: registration.Name, TelemetryClientID: "client_first"})
-	require.Equal(t, http.StatusConflict, callManagementRegisterCluster(t, store, uuid.New(), registration).Code)
-	require.NoError(t, db.SqlcClient.TestsRawSQL(t.Context(), `UPDATE public.clusters SET name='Renamed cluster' WHERE id=$1`, clusterID))
-	registration.TelemetryClientId = new("client_replacement")
-	require.Equal(t, http.StatusNoContent, callManagementRegisterCluster(t, store, clusterID, registration).Code)
-	rows, err = db.SqlcClient.ListTelemetryNames(t.Context())
-	require.NoError(t, err)
-	require.Contains(t, rows, queries.ListTelemetryNamesRow{Kind: "cluster", ID: clusterID.String(), Name: "Renamed cluster", TelemetryClientID: "client_replacement"})
-	registration.TelemetryClientId = nil
-	require.Equal(t, http.StatusNoContent, callManagementRegisterCluster(t, store, clusterID, registration).Code)
-	rows, err = db.SqlcClient.ListTelemetryNames(t.Context())
-	require.NoError(t, err)
-	require.Contains(t, rows, queries.ListTelemetryNamesRow{Kind: "cluster", ID: clusterID.String(), Name: "Renamed cluster", TelemetryClientID: "client_replacement"})
 }

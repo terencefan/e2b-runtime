@@ -39,6 +39,11 @@ const (
 	// duplicates the team group key: PostHog is not promoting $groups.team to $group_0
 	teamIDKey = "team_id"
 
+	// clusterKey names the cluster an event came from, so PostHog can count
+	// starts per cluster. The value is the api's DEPLOYMENT_ENVIRONMENT
+	// setting.
+	clusterKey = "cluster"
+
 	// teamIdentifyTTL bounds how long IdentifyAnalyticsTeam suppresses an
 	// unchanged identify for a team. PostHog persists group properties, so
 	// re-sending an identical $groupidentify only adds ingestion volume; the
@@ -57,6 +62,9 @@ const (
 type PosthogClient struct {
 	client posthog.Client
 
+	// cluster is set on every captured event when not empty.
+	cluster string
+
 	// posthog-go closes its message channel in Close; closed keeps Enqueue
 	// from sending once Close has started.
 	mu     sync.RWMutex
@@ -68,12 +76,26 @@ type PosthogClient struct {
 	// callers for such a team return instead of waiting, and one identify at
 	// a time per team keeps the cached name equal to the one enqueued last.
 	identifying sync.Map
+
+	// rollups holds the events CountAnalyticsTeamEvent counted and has not
+	// sent yet.
+	rollups *eventRollups
 }
 
-func NewPosthogClient(ctx context.Context, posthogAPIKey string) (*PosthogClient, error) {
+// Option configures a PosthogClient.
+type Option func(*PosthogClient)
+
+// WithCluster tags every captured event with the cluster the API runs in.
+// An empty value adds no property.
+func WithCluster(cluster string) Option {
+	return func(p *PosthogClient) { p.cluster = cluster }
+}
+
+func NewPosthogClient(ctx context.Context, posthogAPIKey string, opts ...Option) (*PosthogClient, error) {
 	posthogLogger := posthog.StdLogger(log.New(os.Stderr, "posthog ", log.LstdFlags), false)
 
-	if strings.TrimSpace(posthogAPIKey) == "" {
+	enabled := strings.TrimSpace(posthogAPIKey) != ""
+	if !enabled {
 		logger.L().Info(ctx, "No Posthog API key provided, silencing logs")
 
 		writer := &utils.NoOpWriter{}
@@ -93,10 +115,21 @@ func NewPosthogClient(ctx context.Context, posthogAPIKey string) (*PosthogClient
 		logger.L().Fatal(ctx, "error initializing Posthog client", zap.Error(err))
 	}
 
-	return &PosthogClient{
+	p := &PosthogClient{
 		client:          client,
 		identifiedTeams: identifiedTeams,
-	}, nil
+		rollups:         newEventRollups(),
+	}
+	for _, opt := range opts {
+		opt(p)
+	}
+
+	// Without an API key nothing is sent, so nothing is counted either.
+	if enabled {
+		p.startRollups(ctx, rollupInterval)
+	}
+
+	return p, nil
 }
 
 // newPosthogClient wraps an enqueuing client. Tests inject a recording client
@@ -105,6 +138,7 @@ func newPosthogClient(client posthog.Client, identifyTTL time.Duration) *Posthog
 	return &PosthogClient{
 		client:          client,
 		identifiedTeams: newIdentifiedTeams(identifyTTL),
+		rollups:         newEventRollups(),
 	}
 }
 
@@ -141,6 +175,9 @@ func (f identifyFailures) Failure(msg posthog.APIMessage, _ error) {
 }
 
 func (p *PosthogClient) Close() error {
+	// The counted events go out before the client stops taking messages.
+	p.stopRollups()
+
 	p.mu.Lock()
 	if p.closed {
 		p.mu.Unlock()
@@ -234,7 +271,19 @@ func (p *PosthogClient) CreateAnalyticsSandboxEvent(ctx context.Context, teamID,
 }
 
 func (p *PosthogClient) createAnalyticsEvent(ctx context.Context, distinctID, teamID, event string, properties posthog.Properties) {
-	err := p.enqueue(posthog.Capture{
+	if err := p.capture(distinctID, teamID, event, properties); err != nil {
+		logger.L().Error(ctx, "error when sending event to Posthog", zap.Error(err))
+	}
+}
+
+// capture enqueues an event and returns the error, for a caller that does
+// more than log it.
+func (p *PosthogClient) capture(distinctID, teamID, event string, properties posthog.Properties) error {
+	if p.cluster != "" {
+		properties = properties.Set(clusterKey, p.cluster)
+	}
+
+	return p.enqueue(posthog.Capture{
 		DistinctId: distinctID,
 		Event:      event,
 		Properties: properties.
@@ -244,9 +293,6 @@ func (p *PosthogClient) createAnalyticsEvent(ctx context.Context, distinctID, te
 		Groups: posthog.NewGroups().
 			Set("team", teamID),
 	})
-	if err != nil {
-		logger.L().Error(ctx, "error when sending event to Posthog", zap.Error(err))
-	}
 }
 
 func (p *PosthogClient) GetPackageToPosthogProperties(header *http.Header) posthog.Properties {

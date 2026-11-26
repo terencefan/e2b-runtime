@@ -11,9 +11,9 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	dbtypes "github.com/e2b-dev/infra/packages/api/internal/db/pkg/types"
 	"github.com/e2b-dev/infra/packages/auth/pkg/auth"
 	"github.com/e2b-dev/infra/packages/auth/pkg/types"
-	dbtypes "github.com/e2b-dev/infra/packages/db/pkg/types"
 )
 
 // A blocked team keeps read access to its own resources and loses mutations.
@@ -105,6 +105,20 @@ func TestBlockedTeamAllowlistKeepsTemplateTagReads(t *testing.T) {
 		"/templates/:templateID/tags/exists",
 		"/templates/:templateID/tags/groups",
 		"/templates/:templateID/tags/:tag/assignments",
+	} {
+		assert.Contains(t, get, route)
+	}
+}
+
+// A blocked team can still read one template and its builds, as it can list
+// its templates.
+func TestBlockedTeamAllowlistKeepsTemplateInfoAndBuildReads(t *testing.T) {
+	t.Parallel()
+
+	get := blockedTeamAllowlist[http.MethodGet]
+	for _, route := range []string{
+		"/v2/templates/:templateID",
+		"/templates/:templateID/builds",
 	} {
 		assert.Contains(t, get, route)
 	}

@@ -145,6 +145,10 @@ type Config struct {
 	// configures with nothing plugged; 0 is none. A memory resume ignores it and keeps the
 	// region its snapshot recorded.
 	MemoryHotplugMB int64
+	// MemoryMB is the memory the sandbox runs with, in MiB: RamMB of boot RAM and the rest
+	// plugged into the hotplug region. 0 keeps what the snapshot had asked for (nothing for a
+	// template build or a fresh cold boot).
+	MemoryMB int64
 
 	// TotalDiskSizeMB optional, now used only for metrics.
 	TotalDiskSizeMB   int64
@@ -528,10 +532,23 @@ type Sandbox struct {
 	// memoryHotplugMB is the hotplug region this VM has: the one a cold boot configured, or
 	// the one its snapshot recorded. Pause records it.
 	memoryHotplugMB int64
+	// memoryHotplugRequestedMB is how much of that region this VM asked Firecracker to plug: a
+	// resume's target or what its snapshot had asked for, or a cold boot's request. Pause
+	// records it.
+	memoryHotplugRequestedMB int64
+	// memoryResize is this start's change to the plugged memory, which the start completes once
+	// envd answered; nil when the size did not change. Completing it claims it, so it runs once
+	// per lifecycle, however many times ResumeVM runs the same sandbox.
+	memoryResize atomic.Pointer[memoryResize]
 	// readBalloonCaps replaces the device read in tests; nil means the process.
 	readBalloonCaps func(context.Context) (fc.BalloonCaps, error)
 	// readPluggedMemory replaces the hotplug status read in tests; nil means the process.
 	readPluggedMemory func(context.Context) (int64, error)
+	// hotplugOps replaces the Firecracker hotplug reads and requests in tests; nil means the process.
+	hotplugOps memoryHotplugOps
+	// memoryReinit replaces the envd re-init a memory confirmation sends, in tests; nil means
+	// startEnvdReinit.
+	memoryReinit func(context.Context) *envdReinit
 	// balloonReadRetryAt (unix ns) holds off the checkpoint-time device read
 	// after a failure, so an unreadable balloon does not cost every checkpoint
 	// the full read bound.
@@ -552,6 +569,11 @@ type Sandbox struct {
 	// deliveredEnvdVersion is the envd version a confirmed live upgrade delivered in this
 	// life (MarkEnvdDelivered), nil until one does.
 	deliveredEnvdVersion atomic.Pointer[string]
+	// capturedEnvVars is the user environment CaptureEnvdEnvVars read from the running envd
+	// before a live upgrade, nil until one is read. Only CaptureEnvdEnvVars writes it, after
+	// checking it against Config.Envd.Vars; every later /init sends it in place of an empty
+	// Config.Envd.Vars.
+	capturedEnvVars atomic.Pointer[map[string]string]
 	// envdReinit is the most recent post-checkpoint re-init's handle (startEnvdReinit),
 	// which a following Pause stops before freezing. envdReinitHolds, under envdReinitMu,
 	// counts the Pauses between their cut and their freeze (cutEnvdReinit,
@@ -559,6 +581,9 @@ type Sandbox struct {
 	envdReinit      atomic.Pointer[envdReinit]
 	envdReinitMu    sync.Mutex
 	envdReinitHolds int
+	// memoryConfirmReinit is the latest /init a memory confirmation sent, apart from envdReinit
+	// so neither replaces the other; a Pause stops it too, under the same hold.
+	memoryConfirmReinit atomic.Pointer[envdReinit]
 	// lastEnvdInitLoop is the readiness loop the handle's most recent initEnvd ran, which
 	// labels the envd-init duration histogram beside the init call counter.
 	lastEnvdInitLoop atomic.Pointer[envdInitLoop]
@@ -571,6 +596,13 @@ type Sandbox struct {
 	// start that never got a response stays at. It is what the init instruments derive
 	// their protection cohort attribute from.
 	envdMemory atomic.Pointer[EnvdMemoryProtection]
+	// envdMemoryReading is the memory limit and layout the latest served /init reported, and
+	// envdMemoryReadings numbers those readings.
+	envdMemoryReading  atomic.Pointer[envdMemoryReading]
+	envdMemoryReadings atomic.Uint64
+	// lastPluggedMB is the memory Firecracker last reported plugged into the hotplug region,
+	// read while a start confirmed its size; 0 until a read landed.
+	lastPluggedMB atomic.Int64
 	// envdReportedDefaults is what the running envd said it is effectively serving
 	// with, from the X-Envd-Defaults header on its most recent /init. Nil means the
 	// running envd never reported any — which is a CAPABILITY signal, not an empty
@@ -620,6 +652,9 @@ type Sandbox struct {
 	// reboot in place calls the same one, so a failed subscriber is retried.
 	networkRelease network.ReleaseNotify
 	rootfsRelease  *handover
+	// planeRelease closes the sandbox's data plane from the cleanup chain,
+	// after the rootfs it serves; a reboot in place takes it with the rootfs.
+	planeRelease *handover
 
 	// executionSpan is this lifecycle's "execute sandbox" span, for linking.
 	executionSpan trace.SpanContext
@@ -776,6 +811,24 @@ func (s *Sandbox) MachineVcpus() int64 {
 // in MiB; 0 is none. Pause records it as the snapshot's memory_hotplug_mb.
 func (s *Sandbox) MemoryHotplugMB() int64 {
 	return s.memoryHotplugMB
+}
+
+// MemoryMB is the memory this sandbox runs with, in MiB: boot RAM plus what it asked Firecracker
+// to plug, including a size kept from its snapshot. The node's accounting counts this, not boot RAM.
+func (s *Sandbox) MemoryMB() int64 {
+	return s.Config.RamMB + s.memoryHotplugRequestedMB
+}
+
+// MemoryHotplugRequestedMB is how much of the hotplug region this VM asked Firecracker to plug, in
+// MiB; the guest never plugs more. Pause records it as the snapshot's memory_hotplug_requested_mb.
+func (s *Sandbox) MemoryHotplugRequestedMB() int64 {
+	return s.memoryHotplugRequestedMB
+}
+
+// LastPluggedMB is the memory Firecracker last reported plugged while a start confirmed its size,
+// in MiB; 0 before any such read.
+func (s *Sandbox) LastPluggedMB() int64 {
+	return s.lastPluggedMB.Load()
 }
 
 func (s *Sandbox) LoggerMetadata() sbxlogger.SandboxMetadata {
@@ -939,6 +992,10 @@ type Factory struct {
 	// with every sandbox it creates for the running-version label.
 	envdTargets *envdTargetVersions
 
+	// dataPlane chooses what serves each sandbox's memory and disk: the
+	// in-process handler and NBD unless an edition set another.
+	dataPlane DataPlane
+
 	// swapEnvdBinary is the offline envd upgrade's one call into the host. Nil
 	// means rootfs.SwapEnvdBinary; a test substitutes it to drive the decision
 	// flow around the call -- which refusal defers, which failure still boots the
@@ -963,6 +1020,17 @@ func (f *Factory) offlineSwap() func(ctx context.Context, rootfsPath, srcPath st
 	return func(ctx context.Context, rootfsPath, srcPath string) (rootfs.SwapResult, error) {
 		return rootfs.SwapEnvdBinary(ctx, rootfsPath, srcPath, f.config.OrchestratorBaseDir)
 	}
+}
+
+// WithDataPlane makes the factory serve new sandboxes through dp instead of
+// the in-process handler and NBD; nil keeps the current one. Sandboxes
+// already running keep theirs.
+func (f *Factory) WithDataPlane(dp DataPlane) *Factory {
+	if dp != nil {
+		f.dataPlane = dp
+	}
+
+	return f
 }
 
 // NewFactory builds the sandbox factory. It takes a context because it does
@@ -1006,6 +1074,7 @@ func NewFactory(
 		// warm counter exists to make distinguishable from a working node.
 		envdBinCache: newEnvdBinCache(config.OrchestratorBaseDir),
 		envdTargets:  &envdTargetVersions{},
+		dataPlane:    NewInProcessDataPlane(),
 	}
 
 	// Warm the promoted binary now rather than leaving it to the first resume that
@@ -1220,6 +1289,9 @@ type handedOver struct {
 	rootfs        rootfs.Provider
 	releaseSlot   func(ctx context.Context) error
 	releaseRootfs func(ctx context.Context) error
+	// releasePlane closes the data plane that serves the overlay; nil when
+	// the previous lifecycle had nothing to hand over.
+	releasePlane func(ctx context.Context) error
 	// envdVersion is the envd an offline upgrade installed on the overlay, "" when
 	// the template's own is on it; the next lifecycle's network admission reads it.
 	envdVersion string
@@ -1316,6 +1388,10 @@ func (f *Factory) CreateSandbox(
 	if err != nil {
 		return nil, err
 	}
+	memoryRequestMB, err := requestedMemoryHotplug(config.MemoryMB, config.RamMB, config.MemoryHotplugMB, 0, false)
+	if err != nil {
+		return nil, err
+	}
 
 	createOpts := createOptions{networkAssignReason: NetworkAssignReasonCreate}
 	for _, opt := range opts {
@@ -1341,7 +1417,7 @@ func (f *Factory) CreateSandbox(
 	// A handed-over slot and overlay belong to this lifecycle from here on:
 	// their releases join the cleanup chain before anything that can fail, so
 	// a boot that fails on its cgroup still returns them.
-	var slotRelease, rootfsRelease *handover
+	var slotRelease, rootfsRelease, planeRelease *handover
 	var networkRelease network.ReleaseNotify
 	if h := createOpts.handedOver; h != nil {
 		// The slot's release carries this lifecycle's identity: the network
@@ -1350,6 +1426,10 @@ func (f *Factory) CreateSandbox(
 		networkRelease = f.Sandboxes.NetworkRelease(runtime.SandboxID, lifecycleID)
 		slotRelease = newHandover(returnNetworkSlot(f.networkPool, h.slot, networkRelease))
 		cleanup.Add(ctx, slotRelease.run)
+		// The data plane serving the overlay moves with it and keeps its
+		// place in the chain: after the overlay's close, as before.
+		planeRelease = newHandover(h.releasePlane)
+		cleanup.Add(ctx, planeRelease.run)
 		rootfsRelease = newHandover(h.releaseRootfs)
 		cleanup.Add(ctx, rootfsRelease.run)
 	}
@@ -1381,7 +1461,7 @@ func (f *Factory) CreateSandbox(
 		// release joined the cleanup chain above.
 		rootfsProvider = h.rootfs
 	} else {
-		rootfsProvider, rootfsRelease, err = f.startRootfs(ctx, execCtx, template, rootfsCachePath, sandboxFiles, cleanup, sbxLogger)
+		rootfsProvider, rootfsRelease, planeRelease, err = f.startRootfs(ctx, execCtx, template, rootfsCachePath, sandboxFiles, cleanup, runtime.SandboxID, sbxLogger)
 		if err != nil {
 			return nil, err
 		}
@@ -1511,7 +1591,11 @@ func (f *Factory) CreateSandbox(
 		slotRelease:    slotRelease,
 		networkRelease: networkRelease,
 		rootfsRelease:  rootfsRelease,
+		planeRelease:   planeRelease,
 		executionSpan:  trace.SpanContextFromContext(execCtx),
+
+		// A cold boot starts with nothing plugged; the request is sent once the guest is up.
+		memoryHotplugRequestedMB: memoryRequestMB,
 	}
 
 	// The network-assign hook reads the envd version the guest will boot and
@@ -1551,6 +1635,9 @@ func (f *Factory) CreateSandbox(
 	sbx.StampBalloonMode(balloonModeOf(bootBalloonCaps(config, freePageHinting)))
 	sbx.resolvedVmVcpus = max(config.Vcpu, config.ConfiguredVmVcpus)
 	sbx.memoryHotplugMB = processOptions.MemoryHotplugMB
+	if memoryRequestMB > 0 {
+		sbx.memoryResize.Store(&memoryResize{requestedMB: memoryRequestMB, coldBoot: true})
+	}
 
 	processOptions.ACPIPowerOff = acpiPowerOffFor(ctx, f.featureFlags, runtime, config)
 	err = fcHandle.Create(
@@ -1609,19 +1696,55 @@ func (f *Factory) CreateSandbox(
 	return sbx, nil
 }
 
-// startRootfs creates the sandbox's rootfs overlay, registers its Close in
-// cleanup and starts serving it under execCtx.
+// startRootfs builds and starts the root disk of a fresh start: the data
+// plane's provider when it serves the disk, else NBD, or the Direct provider
+// over a prepared rootfs file. The plane's Close joins the cleanup as soon as
+// ForSandbox returns, so it runs on every failure after that point; the two
+// handovers returned are the provider's close and the plane's close, in the
+// order a reboot in place takes them.
 func (f *Factory) startRootfs(
 	ctx, execCtx context.Context,
 	template template.Template,
 	rootfsCachePath string,
 	sandboxFiles *storage.SandboxFiles,
 	cleanup *Cleanup,
+	sandboxID string,
 	sbxLogger logger.Logger,
-) (rootfs.Provider, *handover, error) {
-	rootFS, err := template.Rootfs()
+) (rootfs.Provider, *handover, *handover, error) {
+	sandboxPlane, err := f.dataPlane.ForSandbox(ctx, SandboxDataPlaneRequest{
+		SandboxID:          sandboxID,
+		UffdSocketPath:     sandboxFiles.SandboxUffdSocketPath(),
+		RootfsCachePath:    sandboxFiles.SandboxCacheRootfsPath(f.config.StorageConfig),
+		PreparedRootfsPath: rootfsCachePath,
+		CacheDir:           f.config.DefaultCacheDir,
+		Logger:             sbxLogger,
+		Files:              sandboxFiles,
+	})
 	if err != nil {
-		return nil, nil, fmt.Errorf("failed to get rootfs: %w", err)
+		return nil, nil, nil, fmt.Errorf("data plane for sandbox: %w", err)
+	}
+	// Registered before the disk is asked for, so it runs after the
+	// provider's own close; a reboot in place takes it with the provider.
+	planeRelease := newHandover(sandboxPlane.Close)
+	cleanup.Add(ctx, planeRelease.run)
+
+	rootFS, err := template.Rootfs(ctx)
+	if err != nil {
+		return nil, nil, nil, fmt.Errorf("failed to get rootfs: %w", err)
+	}
+
+	if provider, ok, err := sandboxPlane.Rootfs(ctx, rootFS); err != nil {
+		return nil, nil, nil, fmt.Errorf("data plane rootfs provider: %w", err)
+	} else if ok {
+		if provider == nil {
+			return nil, nil, nil, errors.New("data plane returned no rootfs provider")
+		}
+
+		telemetry.ReportEvent(ctx, "root disk served by the data plane")
+		rootfsRelease := newHandover(nil)
+		startRootfsProviderVia(ctx, execCtx, cleanup, provider, rootfsRelease, sbxLogger)
+
+		return provider, rootfsRelease, planeRelease, nil
 	}
 
 	var rootfsProvider rootfs.Provider
@@ -1645,12 +1768,12 @@ func (f *Factory) startRootfs(
 		)
 	}
 	if err != nil {
-		return nil, nil, fmt.Errorf("failed to create rootfs overlay: %w", err)
+		return nil, nil, nil, fmt.Errorf("failed to create rootfs overlay: %w", err)
 	}
 	rootfsRelease := newHandover(nil)
 	startRootfsProviderVia(ctx, execCtx, cleanup, rootfsProvider, rootfsRelease, sbxLogger)
 
-	return rootfsProvider, rootfsRelease, nil
+	return rootfsProvider, rootfsRelease, planeRelease, nil
 }
 
 // Usage: defer handleSpanError(span, &err)
@@ -1914,6 +2037,10 @@ func (f *Factory) ResumeSandbox(
 	if err := config.FirecrackerConfig.RefuseMemoryHotplugRestore(meta.MemoryHotplugMB); err != nil {
 		return nil, err
 	}
+	memoryRequestMB, err := requestedMemoryHotplug(config.MemoryMB, config.RamMB, meta.MemoryHotplugMB, meta.MemoryHotplugRequestedMB, true)
+	if err != nil {
+		return nil, err
+	}
 
 	lifecycleID := ropts.lifecycleID
 	if lifecycleID == "" {
@@ -1940,15 +2067,67 @@ func (f *Factory) ResumeSandbox(
 
 	// Uffd initialization
 	fcUffdPath := sandboxFiles.SandboxUffdSocketPath()
-	uffdPromise := utils.NewPromise(func() (*uffd.Uffd, error) {
-		memfile, err := t.Memfile(ctx)
+	// The data plane decides what serves this sandbox's memory and disk: the
+	// in-process handler and NBD unless the edition supplies its own. The
+	// template rootfs is handed over as a getter so a data plane that does
+	// not serve the disk never waits for it here, ahead of the memory and
+	// network work below.
+	sandboxPlane, err := f.dataPlane.ForSandbox(ctx, SandboxDataPlaneRequest{
+		SandboxID:       runtime.SandboxID,
+		UffdSocketPath:  fcUffdPath,
+		RootfsCachePath: sandboxFiles.SandboxCacheRootfsPath(f.config.StorageConfig),
+		CacheDir:        f.config.DefaultCacheDir,
+		Logger:          sbxLogger,
+		Files:           sandboxFiles,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("data plane for sandbox: %w", err)
+	}
+	// Registered before either device is asked for, so it runs after the
+	// handler's and the provider's own teardown, on every path from here; a
+	// reboot in place takes it with the disk. Once the device constructors
+	// exist below, the entry waits for them first, unless the plane is the
+	// in-process one, whose Close releases nothing.
+	planeRelease := newHandover(sandboxPlane.Close)
+	cleanup.Add(ctx, planeRelease.run)
+	// The device constructors run under a context a failed resume cancels
+	// before its cleanup runs, so they unwind instead of holding the failed
+	// request until a cold fetch or a device acquisition completes. It is
+	// cancelled on the way out of a success too, once every constructor has
+	// returned, like the request context it derives from.
+	constructCtx, cancelConstruct := context.WithCancelCause(ctx)
+	defer func() {
+		if e != nil {
+			cancelConstruct(fmt.Errorf("the resume failed before its devices were built: %w", e))
+
+			return
+		}
+		cancelConstruct(nil)
+	}()
+	uffdPromise := utils.NewPromise(func() (uffd.Handler, error) {
+		memfile, err := t.Memfile(constructCtx)
 		if err != nil {
 			return nil, fmt.Errorf("failed to get memfile: %w", err)
 		}
 
 		telemetry.ReportEvent(ctx, "got template memfile")
 
-		return uffd.New(memfile, fcUffdPath, sbxLogger), nil
+		// A resume that failed meanwhile has cancelled construction: do not
+		// ask the plane for a handler that would only be started and stopped.
+		if err := constructCtx.Err(); err != nil {
+			return nil, fmt.Errorf("memory handler not built: %w", context.Cause(constructCtx))
+		}
+
+		u, err := sandboxPlane.Memory(constructCtx, memfile)
+		if err != nil {
+			return nil, fmt.Errorf("data plane memory handler: %w", err)
+		}
+		if u == nil {
+			return nil, errors.New("data plane returned no memory handler")
+		}
+		u.SetMemfdUnusedTail(memoryHotplugUnusedBytes(meta.MemoryHotplugMB, 0, memoryRequestMB))
+
+		return u, nil
 	})
 
 	// Prefetching. Derive the prefetch context and register its cancel with the
@@ -2081,15 +2260,40 @@ func (f *Factory) ResumeSandbox(
 	// Rootfs initialization
 	rootfsRelease := newHandover(nil)
 	overlayPromise := utils.NewPromise(func() (rootfs.Provider, error) {
-		readonlyRootfs, err := t.Rootfs()
+		readonlyRootfs, err := t.Rootfs(constructCtx)
 		if err != nil {
 			return nil, fmt.Errorf("failed to get rootfs: %w", err)
 		}
 
 		telemetry.ReportEvent(ctx, "got template rootfs")
 
+		// A resume that failed meanwhile has cancelled construction: do not
+		// ask the plane for a disk, and do not build the NBD overlay, since
+		// starting either only to close it would hold the failed resume on
+		// a device attach.
+		if err := constructCtx.Err(); err != nil {
+			return nil, fmt.Errorf("rootfs not built: %w", context.Cause(constructCtx))
+		}
+
+		if provider, ok, err := sandboxPlane.Rootfs(constructCtx, readonlyRootfs); err != nil {
+			return nil, fmt.Errorf("data plane rootfs provider: %w", err)
+		} else if ok {
+			if provider == nil {
+				return nil, errors.New("data plane returned no rootfs provider")
+			}
+
+			telemetry.ReportEvent(ctx, "root disk served by the data plane")
+			startRootfsProviderVia(ctx, execCtx, cleanup, provider, rootfsRelease, sbxLogger)
+
+			return provider, nil
+		}
+
+		if err := constructCtx.Err(); err != nil {
+			return nil, fmt.Errorf("rootfs overlay not built: %w", context.Cause(constructCtx))
+		}
+
 		overlay, err := rootfs.NewNBDProvider(
-			ctx,
+			constructCtx,
 			readonlyRootfs,
 			sandboxFiles.SandboxCacheRootfsPath(f.config.StorageConfig),
 			f.devicePool,
@@ -2128,6 +2332,15 @@ func (f *Factory) ResumeSandbox(
 		return struct{}{}, nil
 	})
 
+	// A resume that fails here returns while a device constructor may still
+	// be running: the plane closes once all of them have finished, so neither
+	// device is asked for after Close and their late teardown comes first.
+	// The in-process plane has nothing to close, so a failed resume on the
+	// default path does not wait for its constructors to unwind.
+	if _, inProcess := sandboxPlane.(inProcessPlane); !inProcess {
+		planeRelease.set(closeDataPlaneAfter(sandboxPlane, uffdPromise.Done(), overlayPromise.Done(), memoryPromise.Done()))
+	}
+
 	// Wait for all resources to be initialized
 	ips, err := ipsPromise.Wait(ctx)
 	if err != nil {
@@ -2157,9 +2370,17 @@ func (f *Factory) ResumeSandbox(
 	if err != nil {
 		return nil, err
 	}
+
+	// Both devices exist and the VM has not resumed: a plane whose disk
+	// writes guest memory outside the handler binds the two here, and the
+	// backend it returns is what pause, export and metrics see from now on.
+	boundMemory, err := bindDataPlaneMemory(ctx, sandboxPlane, uffdPromise, overlay)
+	if err != nil {
+		return nil, err
+	}
 	// ==== END of resources initialization ====
 
-	rootfs, err := t.Rootfs()
+	rootfs, err := t.Rootfs(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get rootfs overlay: %w", err)
 	}
@@ -2255,7 +2476,7 @@ func (f *Factory) ResumeSandbox(
 	resources := &Resources{
 		Slot:   ips,
 		rootfs: overlay,
-		memory: fcUffd,
+		memory: boundMemory,
 	}
 
 	metadata := &Metadata{
@@ -2298,13 +2519,15 @@ func (f *Factory) ResumeSandbox(
 		slotRelease:    slotRelease,
 		networkRelease: networkRelease,
 		rootfsRelease:  rootfsRelease,
+		planeRelease:   planeRelease,
 		executionSpan:  trace.SpanContextFromContext(execCtx),
 
 		// A throwaway resume keeps its warm, customer-indistinguishable start out
 		// of the per-resume KPI histograms (see WaitForEnvd).
-		skipStartupMetrics: !ropts.describesCustomerStart(),
-		resolvedVmVcpus:    resolvedVmVcpus,
-		memoryHotplugMB:    meta.MemoryHotplugMB,
+		skipStartupMetrics:       !ropts.describesCustomerStart(),
+		resolvedVmVcpus:          resolvedVmVcpus,
+		memoryHotplugMB:          meta.MemoryHotplugMB,
+		memoryHotplugRequestedMB: memoryRequestMB,
 
 		skipThaw:             ropts.skipThaw,
 		inheritedEnvdVersion: resumeGateEnvdVersion(ropts.inheritedEnvdVersion, meta.RunningEnvdVersion),
@@ -2392,7 +2615,7 @@ func (f *Factory) ResumeSandbox(
 	// Collect a final stats sample on cleanup while the cgroup is still alive.
 	cleanup.Add(ctx, func(ctx context.Context) error {
 		if sbx.hostStatsCollector != nil {
-			sbx.hostStatsCollector.Stop(ctx)
+			stopHostStatsAfterMemory(ctx, sbx.hostStatsCollector, fcUffd.Exit().WaitWithContext)
 		}
 
 		return nil
@@ -2425,6 +2648,21 @@ func (f *Factory) ResumeSandbox(
 		RefuseSmallerVM: config.ConfiguredVmVcpus > 0,
 	}
 	guestRestore := fc.GuestOptions{ACPIPowerOff: acpiPowerOffOnRestoreFor(ctx, f.featureFlags, runtime, config)}
+	if target, explicit, ok := restoreMemoryHotplugTarget(meta.MemoryHotplugMB, config.MemoryMB, memoryRequestMB); ok {
+		fcHandle.SetMemoryHotplugTarget(target, explicit)
+	}
+	if meta.MemoryHotplugMB > 0 {
+		// The restored device is the truth for the region and its slots; metadata only sized the
+		// handshake's first mapping.
+		fcHandle.OnMemoryHotplugRestored(func(status fc.MemoryHotplugStatus) error {
+			regionMB := status.TotalMB
+			if regionMB == 0 {
+				regionMB = meta.MemoryHotplugMB
+			}
+
+			return fcUffd.ExtendMemfd(memoryHotplugUnusedBytes(regionMB, status.SlotMB, status.RequestedMB))
+		})
+	}
 	var fcStartErr error
 	if ropts.vmPaused {
 		// ResumeVM sets the MMDS metadata after it runs the vCPUs.
@@ -2439,8 +2677,18 @@ func (f *Factory) ResumeSandbox(
 		return nil, fmt.Errorf("failed to start FC: %w", fcStartErr)
 	}
 	// The handshake mapped the guest memory file, if Firecracker passed one,
-	// before the restore returned.
+	// before the restore returned, and the restore extended it to the guest's
+	// hotplug size; nothing may replace the mapping from here on.
+	fcUffd.SealMemfd()
 	ropts.reportGuestMemoryReserved(ctx, fcUffd)
+	if memfd := fcUffd.PeekMemfd(ctx); memfd != nil {
+		telemetry.SetAttributes(ctx,
+			attribute.Int64("sandbox.memfd.mapped_bytes", memfd.MappedBytes()),
+			attribute.Int64("sandbox.memfd.file_bytes", memfd.FileBytes()))
+	}
+	if fcHandle.MemoryHotplugResized() {
+		sbx.memoryResize.Store(&memoryResize{requestedMB: memoryRequestMB})
+	}
 	// For a snapshot that never recorded its size, the loaded VM's count is what the next pause records.
 	if n := fcHandle.VmVcpus(); n > 0 {
 		sbx.resolvedVmVcpus = n
@@ -2491,6 +2739,9 @@ func (f *Factory) ResumeSandbox(
 			StartTypeResume,
 			envdWaitForVolumes(ctx, restoreEnvdTimeoutFor(config, f.GetEnvdTimeout(ctx)), len(config.VolumeMounts)),
 		)
+		if err == nil {
+			sbx.completeMemoryResize(ctx, StartTypeResume)
+		}
 		if err != nil {
 			err = fmt.Errorf("failed to wait for sandbox start: %w", err)
 			if !resetDuringBoot(ctx, sbx, err) {
@@ -2568,6 +2819,7 @@ func (f *Factory) ResumeVM(ctx context.Context, sbx *Sandbox) error {
 	if err != nil {
 		return fmt.Errorf("failed to wait for sandbox start: %w", err)
 	}
+	sbx.completeMemoryResize(ctx, StartTypeResume)
 
 	return nil
 }
@@ -2658,18 +2910,17 @@ func (s *Sandbox) MemoryHandlerErr() error {
 	}
 }
 
-// MemoryPageStates returns the guest memory in each page-tracker state, in
-// bytes, and false when no page tracker serves the guest.
-func (s *Sandbox) MemoryPageStates() ([block.NumStates]int64, bool) {
+// MemoryUsage returns false when this lifecycle has no ready page tracker.
+func (s *Sandbox) MemoryUsage() (block.MemoryUsage, bool) {
 	if s.Resources == nil {
-		return [block.NumStates]int64{}, false
+		return block.MemoryUsage{}, false
 	}
-	reporter, ok := s.memory.(uffd.PageStateReporter)
+	reporter, ok := s.memory.(uffd.MemoryUsageReporter)
 	if !ok {
-		return [block.NumStates]int64{}, false
+		return block.MemoryUsage{}, false
 	}
 
-	return reporter.PageStateBytes()
+	return reporter.MemoryUsage()
 }
 
 func (s *Sandbox) Close(ctx context.Context) error {
@@ -2937,7 +3188,7 @@ func (s *Sandbox) Pause(
 	}
 
 	ctx, span := tracer.Start(ctx, "sandbox-snapshot", trace.WithAttributes(
-		attribute.Bool("fs-only-snapshot", pauseOpts.filesystemSnapshot),
+		attribute.Bool("fs_only_snapshot", pauseOpts.filesystemSnapshot),
 		attribute.String("balloon_mode", s.BalloonMode()),
 	))
 	defer span.End()
@@ -3105,6 +3356,7 @@ func (s *Sandbox) Pause(
 	// Device truth over lineage, like the balloon: a cold boot that configured no region
 	// records none, whatever its template was built with.
 	m = m.WithMemoryHotplugMB(s.memoryHotplugMB)
+	m = m.WithMemoryHotplugRequestedMB(s.memoryHotplugRequestedMB)
 	// The device names the memory image bakes are the ones this VM was loaded with;
 	// a snapshot this runtime made has none and stays as it was.
 	m = m.WithDeviceNames(s.Config.FirecrackerConfig.RootfsDriveID, s.Config.FirecrackerConfig.NetIfaceID, s.Config.FirecrackerConfig.RootfsFile)
@@ -3249,7 +3501,7 @@ func (s *Sandbox) Pause(
 	}
 
 	// Gather data for postprocessing
-	originalRootfs, err := s.Template.Rootfs()
+	originalRootfs, err := s.Template.Rootfs(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get original rootfs: %w", err)
 	}
@@ -5186,7 +5438,7 @@ func returnNetworkSlot(networkPool network.PoolInterface, slot *network.Slot, ne
 func serveMemory(
 	ctx context.Context,
 	cleanup *Cleanup,
-	fcUffd *uffd.Uffd,
+	fcUffd uffd.Handler,
 ) error {
 	ctx, span := tracer.Start(ctx, "serve-memory")
 	defer span.End()

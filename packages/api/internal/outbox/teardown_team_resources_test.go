@@ -13,10 +13,10 @@ import (
 	"github.com/riverqueue/river/rivertest"
 	"github.com/stretchr/testify/require"
 
+	dbmodule "github.com/e2b-dev/infra/packages/api/internal/db"
+	"github.com/e2b-dev/infra/packages/api/internal/db/pkg/outbox"
+	"github.com/e2b-dev/infra/packages/api/internal/db/pkg/testutils"
 	"github.com/e2b-dev/infra/packages/api/internal/sandbox"
-	dbmodule "github.com/e2b-dev/infra/packages/db"
-	"github.com/e2b-dev/infra/packages/db/pkg/outbox"
-	"github.com/e2b-dev/infra/packages/db/pkg/testutils"
 	"github.com/e2b-dev/infra/packages/shared/pkg/sharedriver"
 )
 
@@ -195,7 +195,7 @@ func TestTeardownTeamResourcesRunsThroughTheOutboxClient(t *testing.T) {
 	case event := <-completed:
 		require.Equal(t, inserted.Job.ID, event.Job.ID)
 	case <-time.After(30 * time.Second):
-		t.Fatal("the teardown job did not complete")
+		require.Fail(t, "the teardown job did not complete")
 	}
 	require.Equal(t, fullTeardown, recorder.recorded())
 }

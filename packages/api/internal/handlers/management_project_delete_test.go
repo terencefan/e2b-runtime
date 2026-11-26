@@ -2,6 +2,7 @@ package handlers
 
 import (
 	"context"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -10,16 +11,73 @@ import (
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
+	"github.com/riverqueue/river"
+	"github.com/riverqueue/river/riverdriver/riverpgxv5"
+	"github.com/riverqueue/river/rivertype"
 	"github.com/stretchr/testify/require"
 
-	"github.com/e2b-dev/infra/packages/api/internal/management"
+	"github.com/e2b-dev/infra/packages/api/internal/authservice"
+	dbmodule "github.com/e2b-dev/infra/packages/api/internal/db"
+	authqueries "github.com/e2b-dev/infra/packages/api/internal/db/pkg/auth/queries"
+	"github.com/e2b-dev/infra/packages/api/internal/db/pkg/outbox"
+	"github.com/e2b-dev/infra/packages/api/internal/db/pkg/testutils"
 	sharedauth "github.com/e2b-dev/infra/packages/auth/pkg/auth"
-	authqueries "github.com/e2b-dev/infra/packages/db/pkg/auth/queries"
-	"github.com/e2b-dev/infra/packages/db/pkg/testutils"
-	"github.com/e2b-dev/infra/packages/db/queries"
+	"github.com/e2b-dev/infra/packages/shared/pkg/grpc/contracts/webhooks/management/clienttests"
 	"github.com/e2b-dev/infra/packages/shared/pkg/keys"
 	redisutils "github.com/e2b-dev/infra/packages/shared/pkg/redis"
 )
+
+func TestDeleteProjectQueuesOneWebhookRetirementWithoutCallingBackend(t *testing.T) {
+	t.Parallel()
+
+	db := testutils.SetupDatabase(t)
+	store, _ := newManagementStore(t, db)
+	project := testutils.CreateTestTeam(t, db)
+	store.webhookManagement = clienttests.NewMockWebhookManagementServiceClient(t)
+	for range 2 {
+		require.Equal(t, http.StatusNoContent, callDeleteProject(t, store, project).Code)
+	}
+	deleted, err := store.IsProjectDeleted(t.Context(), project)
+	require.NoError(t, err)
+	require.True(t, deleted)
+	got, err := store.riverClient.JobList(t.Context(), river.NewJobListParams().Kinds(outbox.RetireProjectWebhooks{}.Kind()))
+	require.NoError(t, err)
+	require.Len(t, got.Jobs, 1)
+	require.JSONEq(t, `{"project_id":"`+project.String()+`"}`, string(got.Jobs[0].EncodedArgs))
+	require.Equal(t, 1, teardownJobs(t, db, project))
+}
+
+func TestWebhookEnqueueFailureRollsBackProjectDeletion(t *testing.T) {
+	t.Parallel()
+
+	db := testutils.SetupDatabase(t)
+	store, _ := newManagementStore(t, db)
+	project := testutils.CreateTestTeam(t, db)
+	rejected := false
+	rejectRetirement := river.HookInsertBeginFunc(func(ctx context.Context, params *rivertype.JobInsertParams) error {
+		if _, ok := params.Args.(outbox.RetireProjectWebhooks); ok {
+			rejected = true
+
+			return errors.New("webhook retirement insert failed")
+		}
+
+		return ctx.Err()
+	})
+	client, err := river.NewClient(riverpgxv5.New(db.SqlcClient.Pool()), &river.Config{
+		Schema:  dbmodule.RiverSchema,
+		Plugins: []rivertype.Plugin{rejectRetirement},
+	})
+	require.NoError(t, err)
+	store.riverClient = client
+	store.webhookManagement = clienttests.NewMockWebhookManagementServiceClient(t)
+
+	require.Equal(t, http.StatusInternalServerError, callDeleteProject(t, store, project).Code)
+	require.True(t, rejected)
+	deleted, err := store.IsProjectDeleted(t.Context(), project)
+	require.NoError(t, err)
+	require.False(t, deleted)
+	require.Zero(t, teardownJobs(t, db, project))
+}
 
 func TestDeleteProjectSoftDeletesItAndEnqueuesItsTeardown(t *testing.T) {
 	t.Parallel()
@@ -28,10 +86,8 @@ func TestDeleteProjectSoftDeletesItAndEnqueuesItsTeardown(t *testing.T) {
 	ctx := t.Context()
 	store, _ := newManagementStore(t, db)
 	projectID := testutils.CreateTestTeam(t, db)
-	clusterID, err := db.SqlcClient.CreateCluster(ctx, queries.CreateClusterParams{
-		Name: "project-cluster", Endpoint: "https://cluster.example.test", Token: "test-token",
-	})
-	require.NoError(t, err)
+	clusterID := uuid.New()
+	insertCluster(t, db, clusterID, false)
 	require.NoError(t, db.SqlcClient.TestsRawSQL(ctx, `UPDATE public.teams SET cluster_id = $2 WHERE id = $1`, projectID, clusterID))
 	addProjectMember(t, db, projectID)
 	addProjectAPIKey(t, db, projectID)
@@ -69,6 +125,9 @@ func TestDeleteProjectSoftDeletesItAndEnqueuesItsTeardown(t *testing.T) {
 	require.NoError(t, err)
 	require.Empty(t, members)
 	require.Equal(t, 1, teardownJobs(t, db, projectID))
+	retirements, err := store.riverClient.JobList(ctx, river.NewJobListParams().Kinds(outbox.RetireProjectWebhooks{}.Kind()))
+	require.NoError(t, err)
+	require.Empty(t, retirements.Jobs)
 }
 
 // A retry answers 204 again. While the first teardown is open the enqueue is a
@@ -114,18 +173,11 @@ func TestDeleteProjectRetryRepairsWhatRacedTheDeletion(t *testing.T) {
 	lateSnapshot := testutils.UpsertTestSnapshot(t, ctx, db, "snapshot-"+uuid.NewString(), "sandbox-"+uuid.NewString(), projectID, baseTemplate)
 	addProjectAPIKey(t, db, projectID)
 	addProjectMember(t, db, projectID)
-	clusterID, err := db.SqlcClient.CreateCluster(ctx, queries.CreateClusterParams{
-		Name: "raced-cluster", Endpoint: "https://cluster.example.test", Token: "test-token",
-	})
-	require.NoError(t, err)
-	// An upsert that passed its deleted-project check before the deletion
-	// committed reaches the service and assigns its cluster.
-	_, _, err = store.managementService.UpsertProject(ctx, management.Project{
-		ClusterID: &clusterID, ID: projectID, Name: "raced", Slug: "raced-" + projectID.String()[:8], Email: "raced@example.test",
-	})
-	require.NoError(t, err)
+	clusterID := uuid.New()
+	insertCluster(t, db, clusterID, false)
 	require.NoError(t, db.SqlcClient.TestsRawSQL(ctx,
-		`UPDATE public.teams SET blocked_reason = 'raced block' WHERE id = $1`, projectID))
+		`UPDATE public.teams SET blocked_reason = 'raced block', cluster_id = $2,
+		name = 'raced', slug = $3, email = 'raced@example.test' WHERE id = $1`, projectID, clusterID, "raced-"+projectID.String()[:8]))
 
 	retry := callDeleteProject(t, store, projectID)
 
@@ -158,7 +210,7 @@ func TestDeleteProjectLeavesALateKeyRefusedByAuth(t *testing.T) {
 
 	db := testutils.SetupDatabase(t)
 	ctx := t.Context()
-	auth, err := sharedauth.NewAuthService(ctx, redisutils.SetupInstance(t), db.AuthDB, sharedauth.ProviderConfig{}, http.DefaultClient)
+	auth, err := authservice.NewAuthService(ctx, redisutils.SetupInstance(t), db.AuthDB, sharedauth.ProviderConfig{}, http.DefaultClient)
 	require.NoError(t, err)
 	t.Cleanup(func() { require.NoError(t, auth.Close(context.WithoutCancel(ctx))) })
 	store, _ := newManagementStore(t, db)
@@ -242,7 +294,7 @@ func TestDeleteProjectEvictsTheDeletedKeysCachedAuth(t *testing.T) {
 
 	db := testutils.SetupDatabase(t)
 	ctx := t.Context()
-	auth, err := sharedauth.NewAuthService(ctx, redisutils.SetupInstance(t), db.AuthDB, sharedauth.ProviderConfig{}, http.DefaultClient)
+	auth, err := authservice.NewAuthService(ctx, redisutils.SetupInstance(t), db.AuthDB, sharedauth.ProviderConfig{}, http.DefaultClient)
 	require.NoError(t, err)
 	t.Cleanup(func() { require.NoError(t, auth.Close(context.WithoutCancel(ctx))) })
 	store, _ := newManagementStore(t, db)

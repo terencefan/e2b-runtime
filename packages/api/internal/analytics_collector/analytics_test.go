@@ -221,6 +221,31 @@ func TestSandboxEventIsKeyedBySandbox(t *testing.T) {
 	assert.Equal(t, false, capture.Properties[processPersonProfileKey])
 }
 
+func TestEventCarriesCluster(t *testing.T) {
+	t.Parallel()
+
+	recorder := &captureRecorder{}
+	p := newTestPosthogClient(t, recorder, teamIdentifyTTL)
+	WithCluster("staging")(p)
+
+	p.CreateAnalyticsSandboxEvent(t.Context(), "team-uuid", "sbx-id", "created_instance", posthog.NewProperties())
+
+	capture := recorder.capture(t)
+	assert.Equal(t, "staging", capture.Properties[clusterKey])
+}
+
+func TestEventWithoutClusterOmitsIt(t *testing.T) {
+	t.Parallel()
+
+	recorder := &captureRecorder{}
+	p := newTestPosthogClient(t, recorder, teamIdentifyTTL)
+
+	p.CreateAnalyticsTeamEvent(t.Context(), "team-uuid", "listed sandboxes", posthog.NewProperties())
+
+	capture := recorder.capture(t)
+	assert.NotContains(t, capture.Properties, clusterKey)
+}
+
 func TestIdentifyAnalyticsTeamSendsOncePerTeam(t *testing.T) {
 	t.Parallel()
 
@@ -402,6 +427,9 @@ func TestClientWithoutAPIKeyDropsQuietly(t *testing.T) {
 
 	p.IdentifyAnalyticsTeam(t.Context(), "team-a", "Team A")
 	assert.True(t, p.teamIdentified("team-a", "Team A"), "the identify counted as failed")
+
+	p.CountAnalyticsTeamEvent(t.Context(), "team-a", "listed sandboxes", posthog.NewProperties())
+	assert.Zero(t, p.rollups.keysCounted(), "nothing would send the count")
 
 	require.NoError(t, p.Close())
 }

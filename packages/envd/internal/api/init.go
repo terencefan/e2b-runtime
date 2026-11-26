@@ -327,6 +327,14 @@ func (a *API) PostInit(w http.ResponseWriter, r *http.Request) {
 			logger.Info().Dur("clock_correction", correction).Msg("corrected the /init timestamp by the handler's delay")
 		}
 
+		// Before the Timestamp guard and SetData, so neither a stale /init nor one whose
+		// SetData fails skips it: every /init follows a resume, and a sandbox paused
+		// between a memory plug and envd's reaction to it resumes with the memory online
+		// and no event left to fire. Not waited on: the orchestrator gives each /init
+		// attempt tens of milliseconds, and a lowered limit can take longer while the
+		// kernel reclaims.
+		a.memLimits.Request("init")
+
 		// Restore the access token (and env) BEFORE marking the envd initialized.
 		// On a live-upgraded envd, WithAuthorization only fails CLOSED while
 		// !initialized; flipping initialized first, with the token not yet
@@ -356,6 +364,9 @@ func (a *API) PostInit(w http.ResponseWriter, r *http.Request) {
 		// up — a guest process that can't pass auth can't flip this and drive an
 		// unauthenticated upgrade.
 		a.initialized.Store(true)
+		if a.forwarder != nil {
+			a.forwarder.Release()
+		}
 
 		// Before the response is decided: a bodiless 204 reaches the wire only when the
 		// handler returns, after the thaw, so a client that leaves during a slow thaw must be
@@ -381,6 +392,7 @@ func (a *API) PostInit(w http.ResponseWriter, r *http.Request) {
 	// requested. Set before WriteHeader.
 	a.reportEffectiveDefaults(w, logger)
 	a.reportCPUs(w, cpuErr)
+	a.reportMemory(w)
 
 	w.Header().Set("Cache-Control", "no-store")
 
@@ -456,6 +468,13 @@ func (a *API) SetData(ctx context.Context, logger zerolog.Logger, data PostInitJ
 	} else if a.accessToken.IsSet() {
 		logger.Debug().Msg("Clearing access token")
 		a.accessToken.Destroy()
+	}
+
+	// Before the steps that can fail, so a failed /init still stops forwarding.
+	if data.ExposeLocalhostPorts != nil && a.forwarder != nil {
+		if err := a.forwarder.SetLocalhostForwarding(*data.ExposeLocalhostPorts); err != nil {
+			logger.Warn().Err(err).Msg("localhost port forwarding off is incomplete; retrying on the next scan")
+		}
 	}
 
 	if data.HyperloopIP != nil {

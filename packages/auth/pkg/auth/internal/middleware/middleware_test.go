@@ -9,11 +9,12 @@ import (
 	"github.com/getkin/kin-openapi/openapi3filter"
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
+	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
 	"github.com/e2b-dev/infra/packages/auth/pkg/auth/internal/authcontext"
+	"github.com/e2b-dev/infra/packages/auth/pkg/teamdata"
 	"github.com/e2b-dev/infra/packages/auth/pkg/types"
-	authqueries "github.com/e2b-dev/infra/packages/db/pkg/auth/queries"
 )
 
 func TestAdminValidationFunction(t *testing.T) {
@@ -42,7 +43,7 @@ func TestAdminTeamAuthenticatorSetsTeamContext(t *testing.T) {
 
 	ctx := t.Context()
 	teamID := uuid.New()
-	team := types.NewTeam(authqueries.GetTeamByTeamIDRow{ID: teamID})
+	team := &types.Team{Team: &teamdata.Team{ID: teamID}}
 
 	req := httptest.NewRequestWithContext(ctx, http.MethodGet, "/", nil)
 	req.Header.Set(HeaderTeamID, teamID.String())
@@ -59,25 +60,17 @@ func TestAdminTeamAuthenticatorSetsTeamContext(t *testing.T) {
 
 		return team, nil
 	})
-	if got, want := authenticator.SecuritySchemeName(), "AdminTeamAuth"; got != want {
-		t.Fatalf("NewAdminTeamAuthenticator().SecuritySchemeName() = %q, want %q", got, want)
-	}
+	require.Equal(t, "AdminTeamAuth", authenticator.SecuritySchemeName())
 
 	err := authenticator.Authenticate(ctx, ginCtx, &openapi3filter.AuthenticationInput{
 		RequestValidationInput: &openapi3filter.RequestValidationInput{Request: req},
 	})
-	if err != nil {
-		t.Fatalf("AdminTeamAuth.Authenticate(valid team ID) error: %v", err)
-	}
+	require.NoError(t, err)
 
 	got, ok := authcontext.GetTeamInfo(ginCtx)
-	if !ok {
-		t.Fatalf("authcontext.GetTeamInfo(ginCtx) ok = false, want true")
-	}
+	require.True(t, ok, "authcontext.GetTeamInfo(ginCtx) found no team info")
 
-	if got.Team.ID != teamID {
-		t.Errorf("authcontext.GetTeamInfo(ginCtx).Team.ID = %s, want %s", got.Team.ID, teamID)
-	}
+	assert.Equal(t, teamID, got.Team.ID)
 }
 
 // A service defining its own scheme gets the same header handling and the

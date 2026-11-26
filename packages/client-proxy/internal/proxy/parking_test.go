@@ -234,7 +234,7 @@ func TestResumeFlights_CallerThatLeavesWhileParkedIsAnsweredQuietly(t *testing.T
 	select {
 	case <-served:
 	case <-time.After(5 * time.Second):
-		require.FailNow(t, "the handler did not return after the caller left")
+		require.Fail(t, "the handler did not return after the caller left")
 	}
 
 	require.Empty(t, warningsAndAbove(logs))
@@ -289,6 +289,23 @@ func TestResumeFlights_PermanentPlacementRefusalIsNotRetried(t *testing.T) {
 		require.Equal(t, http.StatusConflict, rr.Code)
 		require.Empty(t, rr.Header().Get("Retry-After"))
 		require.Contains(t, rr.Body.String(), `"error_code":"`+proxygrpc.SnapshotGuestAgentUnresponsive+`"`)
+		require.EqualValues(t, 1, resumer.calls.Load())
+		require.Zero(t, p.metrics.parkingWaitSamples(t))
+	})
+
+	// A node refusing the memory size the API sent from its own record refuses it
+	// on every retry: the page is the API's 500 with the code, not a missing sandbox.
+	t.Run(proxygrpc.SandboxMemoryRecordMismatch+" refused", func(t *testing.T) {
+		t.Parallel()
+
+		refusal := placementStatusWithHTTPStatus(t, codes.Internal, proxygrpc.SandboxMemoryRecordMismatch, http.StatusInternalServerError)
+		resumer := &sequenceResumer{errs: []error{refusal, refusal}, route: testRoute}
+		p := newParkedProxy(t, newFFWithParking(t, true, 15000, 512), resumer)
+
+		rr := p.get(t)
+		require.Equal(t, http.StatusInternalServerError, rr.Code)
+		require.Empty(t, rr.Header().Get("Retry-After"))
+		require.Contains(t, rr.Body.String(), `"error_code":"`+proxygrpc.SandboxMemoryRecordMismatch+`"`)
 		require.EqualValues(t, 1, resumer.calls.Load())
 		require.Zero(t, p.metrics.parkingWaitSamples(t))
 	})
@@ -690,7 +707,7 @@ func TestResumeFlights_FlagOffJoinerDoesNotWaitForAnAttemptWithLongToRun(t *test
 	case err = <-joinerResult:
 	case <-time.After(5 * time.Second):
 		close(resumer.release)
-		require.FailNow(t, "the joiner waited for an attempt with long to run")
+		require.Fail(t, "the joiner waited for an attempt with long to run")
 	}
 	var transitioningErr *reverseproxy.SandboxStillTransitioningError
 	require.ErrorAs(t, err, &transitioningErr)
@@ -767,7 +784,7 @@ func TestResumeFlights_FlagOffJoinerDoesNotWaitForTheNextAttempt(t *testing.T) {
 	select {
 	case <-joinerCtx.awaiting: // the joiner holds the first attempt's number and is in its wait
 	case ended := <-waited:
-		require.FailNow(t, "the joiner did not wait for the attempt under way", "%v", ended)
+		require.Fail(t, "the joiner did not wait for the attempt under way", "%v", ended)
 	}
 
 	flights.mu.Lock()
@@ -786,7 +803,7 @@ func TestResumeFlights_FlagOffJoinerDoesNotWaitForTheNextAttempt(t *testing.T) {
 	case ended := <-waited:
 		require.True(t, ended)
 	case <-time.After(5 * time.Second):
-		require.FailNow(t, "the joiner waited for the next attempt")
+		require.Fail(t, "the joiner waited for the next attempt")
 	}
 }
 
@@ -1555,7 +1572,7 @@ func TestResumeFlights_RetryNeedsAParkedWaiterAtItsStart(t *testing.T) {
 	go func() { waiting <- flights.beginAttempt(ended, f, true, time.Now().Add(time.Minute)) }()
 	select {
 	case err := <-waiting:
-		require.FailNow(t, "a retry started with an undecided waiter only", "%v", err)
+		require.Fail(t, "a retry started with an undecided waiter only", "%v", err)
 	case <-time.After(100 * time.Millisecond):
 	}
 	require.False(t, f.attempting)
@@ -1690,7 +1707,7 @@ func TestResumeFlights_CloseEndsParkedFlights(t *testing.T) {
 			require.ErrorIs(t, r.err, errFlightClosed)
 			require.ErrorIs(t, r.err, errStillTransitioning)
 		case <-time.After(5 * time.Second):
-			require.FailNow(t, "the parked flight outlived Close")
+			require.Fail(t, "the parked flight outlived Close")
 		}
 	}
 	require.Zero(t, flightsInRegistry(flights))
@@ -1858,7 +1875,7 @@ func TestResumeFlights_CloseDuringTheFirstAttemptCountsEveryWaiterCanceled(t *te
 			require.Equal(t, "sbx", capacityErr.SandboxID())
 			require.ErrorIs(t, r.err, errFlightClosed)
 		case <-time.After(5 * time.Second):
-			require.FailNow(t, "the flight outlived Close")
+			require.Fail(t, "the flight outlived Close")
 		}
 	}
 	require.Zero(t, flightsInRegistry(flights))
@@ -1888,7 +1905,7 @@ func TestClientProxy_CloseDuringTheFirstAttemptAnswersWithTheCapacityPage(t *tes
 		require.Equal(t, "2", rr.Header().Get("Retry-After"))
 		require.Contains(t, rr.Body.String(), `cannot be resumed right now`)
 	case <-time.After(5 * time.Second):
-		require.FailNow(t, "the request outlived Close")
+		require.Fail(t, "the request outlived Close")
 	}
 	require.EqualValues(t, 1, p.metrics.flightCount(t, resumeFlightRoleLeader, resumeFlightResultCanceled))
 	require.Zero(t, p.metrics.flightCount(t, resumeFlightRoleLeader, resumeFlightResultError))
@@ -1947,7 +1964,7 @@ func TestResumeFlights_RejectionAfterCloseIsNotCountedAsAJoiner(t *testing.T) {
 		require.Same(t, testRoute, r.route)
 		require.NoError(t, r.err)
 	case <-time.After(5 * time.Second):
-		require.FailNow(t, "the leader outlived the release")
+		require.Fail(t, "the leader outlived the release")
 	}
 	require.NoError(t, <-closing)
 	require.Zero(t, flightsInRegistry(flights))
@@ -1989,7 +2006,7 @@ func TestResumeFlights_CloseWaitsForAFlightInsideItsAttempt(t *testing.T) {
 	require.Eventually(t, func() bool { return isClosed(flights) }, 5*time.Second, 5*time.Millisecond)
 	select {
 	case err := <-closing:
-		require.FailNow(t, "Close returned while the flight was still inside its attempt", "%v", err)
+		require.Fail(t, "Close returned while the flight was still inside its attempt", "%v", err)
 	case <-time.After(200 * time.Millisecond):
 	}
 	require.Equal(t, 1, flightsInRegistry(flights))
@@ -1999,7 +2016,7 @@ func TestResumeFlights_CloseWaitsForAFlightInsideItsAttempt(t *testing.T) {
 	case err := <-closing:
 		require.NoError(t, err)
 	case <-time.After(5 * time.Second):
-		require.FailNow(t, "Close outlived the release")
+		require.Fail(t, "Close outlived the release")
 	}
 	require.Zero(t, flightsInRegistry(flights))
 	served := <-leader
@@ -2033,7 +2050,7 @@ func TestResumeFlights_CloseStopsWaitingWithItsContext(t *testing.T) {
 		require.NoError(t, served.err)
 		require.Same(t, testRoute, served.route)
 	case <-time.After(5 * time.Second):
-		require.FailNow(t, "the leader outlived the release")
+		require.Fail(t, "the leader outlived the release")
 	}
 	require.Zero(t, flightsInRegistry(flights))
 }

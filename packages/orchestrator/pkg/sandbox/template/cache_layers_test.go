@@ -92,7 +92,10 @@ func (f *layerTestTemplate) Close(context.Context) error {
 func (f *layerTestTemplate) Memfile(context.Context) (block.ReadonlyDevice, error) {
 	return f.memfile.Wait()
 }
-func (f *layerTestTemplate) Rootfs() (block.ReadonlyDevice, error)  { return f.rootfs.Wait() }
+
+func (f *layerTestTemplate) Rootfs(ctx context.Context) (block.ReadonlyDevice, error) {
+	return f.rootfs.WaitWithContext(ctx)
+}
 func (f *layerTestTemplate) Snapfile() (File, error)                { return f.snapfile.Wait() }
 func (f *layerTestTemplate) Metadata() (metadata.Template, error)   { return metadata.Template{}, nil }
 func (f *layerTestTemplate) UpdateMetadata(metadata.Template) error { return nil }
@@ -124,7 +127,7 @@ func (f *layerTestTemplate) waitClosed(t *testing.T) {
 	select {
 	case <-f.closed:
 	case <-time.After(5 * time.Second):
-		t.Fatalf("template %q was not closed", f.key)
+		require.Failf(t, "template was not closed", "key %q", f.key)
 	}
 }
 
@@ -134,7 +137,7 @@ func (f *layerTestTemplate) assertNotClosed(t *testing.T) {
 
 	select {
 	case <-f.closed:
-		t.Fatalf("template %q was closed", f.key)
+		require.Failf(t, "template was closed", "key %q", f.key)
 	case <-time.After(50 * time.Millisecond):
 	}
 }
@@ -1028,7 +1031,7 @@ func TestEvictionCallbacksRunOffTheDeletingGoroutine(t *testing.T) {
 	select {
 	case <-deleted:
 	case <-time.After(5 * time.Second):
-		t.Fatal("a delete under extendMu blocked on its eviction callback")
+		require.Fail(t, "a delete under extendMu blocked on its eviction callback")
 	}
 	waitEvicted(t, evicted, tmpl.key)
 }

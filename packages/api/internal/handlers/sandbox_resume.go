@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"time"
 
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
@@ -13,12 +14,13 @@ import (
 
 	"github.com/e2b-dev/infra/packages/api/internal/api"
 	snapshotcache "github.com/e2b-dev/infra/packages/api/internal/cache/snapshots"
+	"github.com/e2b-dev/infra/packages/api/internal/db/pkg/types"
+	"github.com/e2b-dev/infra/packages/api/internal/db/queries"
 	"github.com/e2b-dev/infra/packages/api/internal/orchestrator"
 	"github.com/e2b-dev/infra/packages/api/internal/sandbox"
 	"github.com/e2b-dev/infra/packages/api/internal/utils"
 	"github.com/e2b-dev/infra/packages/auth/pkg/auth"
-	"github.com/e2b-dev/infra/packages/db/pkg/types"
-	"github.com/e2b-dev/infra/packages/db/queries"
+	typesteam "github.com/e2b-dev/infra/packages/auth/pkg/types"
 	"github.com/e2b-dev/infra/packages/shared/pkg/apierrors"
 	"github.com/e2b-dev/infra/packages/shared/pkg/featureflags"
 	"github.com/e2b-dev/infra/packages/shared/pkg/ginutils"
@@ -46,7 +48,7 @@ func (a *APIStore) resumeBackend() resumeWaitOrchestrator {
 }
 
 func (a *APIStore) PostSandboxesSandboxIDResume(c *gin.Context, sandboxID api.SandboxID) {
-	ctx := c.Request.Context()
+	ctx := orchestrator.WithMemoryRoute(c.Request.Context(), orchestrator.MemoryRouteResume)
 
 	// Get team from context, use TeamContextKey
 	teamInfo := auth.MustGetTeamInfo(c)
@@ -187,10 +189,7 @@ func (a *APIStore) PostSandboxesSandboxIDResume(c *gin.Context, sandboxID api.Sa
 		return
 	}
 
-	// Refuse a cpuCount the snapshot or the team cannot honour before the start
-	// is reserved, so the 400 reaches only this request and never a connect or
-	// auto-resume joined to the same start.
-	if apiErr := orchestrator.CheckSandboxCPUCount(ctx, a.featureFlags, teamInfo, lastSnapshot.EnvBuild, body.CpuCount); apiErr != nil {
+	if apiErr := a.validateResumeSize(ctx, teamInfo, lastSnapshot.EnvBuild, body.CpuCount, body.MemoryMB); apiErr != nil {
 		setMemoryOverrideOutcome(c, body.Memory, apiErr)
 		apierrors.SendAPIError(c, apiErr)
 
@@ -214,18 +213,33 @@ func (a *APIStore) PostSandboxesSandboxIDResume(c *gin.Context, sandboxID api.Sa
 		demandsFilesystemBoot(body.Memory, lastSnapshot.Snapshot),
 		nil, // mcp
 		orchestrator.WithCPUCount(body.CpuCount),
+		orchestrator.WithMemoryMB(body.MemoryMB),
 	)
 	setMemoryOverrideOutcome(c, body.Memory, createErr)
 	setResumeGateOutcome(c, body.Memory, lastSnapshot.EnvBuild, createErr)
 	if createErr != nil {
 		responseErr := *createErr
-		responseErr.Retryable = apierrors.UndefinedRetry
+		if !orchestrator.StartErrorKeepsRetryHint(createErr) {
+			responseErr.Retryable = apierrors.UndefinedRetry
+		}
 		apierrors.SendAPIError(c, &responseErr)
 
 		return
 	}
 
 	c.JSON(http.StatusCreated, &sbx)
+}
+
+// validateResumeSize refuses a cpuCount or memoryMB that the paused sandbox's
+// build or the team cannot honour. Resume and connect run it before the start
+// is reserved, so the 400 reaches only the request that named the size and a
+// refused size never holds the start other requests join.
+func (a *APIStore) validateResumeSize(ctx context.Context, team *typesteam.Team, build queries.EnvBuild, cpuCount, memoryMB *int32) *api.APIError {
+	if apiErr := a.orchestrator.CheckSandboxCPUCount(ctx, a.featureFlags, team, build, cpuCount); apiErr != nil {
+		return apiErr
+	}
+
+	return a.orchestrator.CheckSandboxMemory(ctx, a.featureFlags, team, build, memoryMB)
 }
 
 func convertDatabaseMountsToOrchestratorMounts(volumes []*types.SandboxVolumeMountConfig) []*orchestratorgrpc.SandboxVolumeMount {
@@ -443,12 +457,17 @@ func (a *APIStore) buildResumeSandboxDataFromSnapshot(snapshotSandboxID, sandbox
 		// execution still gets a freshly generated execution ID upstream, so no
 		// stored identity subject is carried across.
 		var iam *types.SandboxIam
+		// A fork inherits the parent's TTL, as it does the rest of the config.
+		var pausedTTL *time.Duration
 		if snap.Config != nil {
 			network = snap.Config.Network
 			autoResume = snap.Config.AutoResume
 			volumes = snap.Config.VolumeMounts
 			autoPauseFilesystemOnly = snap.Config.AutoPauseFilesystemOnly
 			iam = snap.Config.Iam
+			if snap.Config.PausedTTL != nil {
+				pausedTTL = new(time.Duration(*snap.Config.PausedTTL) * time.Second)
+			}
 		}
 
 		return orchestrator.SandboxMetadata{
@@ -465,6 +484,8 @@ func (a *APIStore) buildResumeSandboxDataFromSnapshot(snapshotSandboxID, sandbox
 			VolumeMounts:            convertDatabaseMountsToOrchestratorMounts(volumes),
 			EnvdAccessToken:         envdAccessToken,
 			Iam:                     iam,
+			PausedTTL:               pausedTTL,
+			PausedTTLStored:         pausedTTL != nil,
 			NodeID:                  &nodeID,
 			SnapshotSandboxID:       snapshotSandboxID,
 			FilesystemBoot:          filesystemBoot,

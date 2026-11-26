@@ -13,9 +13,10 @@ import (
 	"github.com/stretchr/testify/require"
 	"go.opentelemetry.io/otel/metric/noop"
 
+	"github.com/e2b-dev/infra/packages/api/internal/authservice"
+	"github.com/e2b-dev/infra/packages/api/internal/db/pkg/testutils"
 	"github.com/e2b-dev/infra/packages/api/internal/management"
 	sharedauth "github.com/e2b-dev/infra/packages/auth/pkg/auth"
-	"github.com/e2b-dev/infra/packages/db/pkg/testutils"
 	redisutils "github.com/e2b-dev/infra/packages/shared/pkg/redis"
 )
 
@@ -24,11 +25,11 @@ func TestApplyProjectBanRefusesTheTeamsKeysAndEnqueuesItsContainment(t *testing.
 
 	db := testutils.SetupDatabase(t)
 	ctx := t.Context()
-	auth, err := sharedauth.NewAuthService(ctx, redisutils.SetupInstance(t), db.AuthDB, sharedauth.ProviderConfig{}, http.DefaultClient)
+	auth, err := authservice.NewAuthService(ctx, redisutils.SetupInstance(t), db.AuthDB, sharedauth.ProviderConfig{}, http.DefaultClient)
 	require.NoError(t, err)
 	t.Cleanup(func() { require.NoError(t, auth.Close(context.WithoutCancel(ctx))) })
 	store, _ := newManagementStore(t, db)
-	store.managementService = management.NewService(db.AuthDB, db.SqlcClient, auth, noop.NewMeterProvider())
+	store.managementService = management.NewService(db.AuthDB, db.SqlcClient, auth, store.clusterService, noop.NewMeterProvider())
 	teamID := testutils.CreateTestTeam(t, db)
 	key := addProjectAPIKey(t, db, teamID)
 	ginCtx, _ := gin.CreateTestContext(httptest.NewRecorder())

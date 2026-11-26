@@ -8,9 +8,10 @@ import (
 	"github.com/google/uuid"
 	"go.uber.org/zap"
 
-	authqueries "github.com/e2b-dev/infra/packages/db/pkg/auth/queries"
-	"github.com/e2b-dev/infra/packages/db/pkg/dberrors"
+	"github.com/e2b-dev/infra/packages/api/internal/clusterassign"
+	authqueries "github.com/e2b-dev/infra/packages/api/internal/db/pkg/auth/queries"
 	"github.com/e2b-dev/infra/packages/shared/pkg/logger"
+	"github.com/e2b-dev/infra/packages/shared/pkg/postgres/dberrors"
 )
 
 const teamSlugUniqueConstraint = "teams_slug_unique"
@@ -22,12 +23,11 @@ var (
 
 	// ErrProjectRaced reports an id inserted between the existence check and
 	// this request's own insert.
-	ErrProjectRaced = errors.New("project was created concurrently")
+	ErrProjectRaced        = errors.New("project was created concurrently")
+	ErrProjectClusterFixed = errors.New("the project's cluster cannot be changed")
 )
 
-// Project is the set of properties the caller synchronizes. It sends all of
-// them on every push, so a reconcile is a complete statement rather than a
-// patch.
+// Project carries synchronized metadata and the cluster selected at creation.
 //
 // Slug moves like the others, and the project's template aliases follow it in
 // the same transaction: each one held under an earlier slug is also given under
@@ -53,15 +53,9 @@ func (s *Service) UpsertProject(ctx context.Context, project Project) (stored Pr
 		return Project{}, false, err
 	}
 
-	// A reconcile changes the team, so every cached copy of it is stale — its
-	// own entry, each API key's, each member's. A create has nothing cached.
-	// Logged rather than returned: the row is committed, and a retry cannot
-	// improve on a stale cache.
-	if !created {
-		if err := s.cache.InvalidateTeamCache(ctx, project.ID); err != nil {
-			logger.L().Error(ctx, "invalidating team cache after project reconcile",
-				logger.WithTeamID(project.ID.String()), zap.Error(err))
-		}
+	// A placement acknowledgement covers cache eviction, including on replay.
+	if err := s.cache.InvalidateTeamCache(ctx, project.ID); err != nil {
+		return Project{}, false, fmt.Errorf("invalidate project placement cache: %w", err)
 	}
 
 	return stored, created, nil
@@ -75,16 +69,33 @@ func (s *Service) writeProject(ctx context.Context, project Project) (stored Pro
 	if err != nil {
 		return Project{}, false, fmt.Errorf("start project upsert transaction: %w", err)
 	}
+	// Without the request's context, so a caller that gives up mid-check
+	// still ends the transaction and frees the assignment lock.
 	defer func() {
-		_ = tx.Rollback(ctx)
+		_ = tx.Rollback(context.WithoutCancel(ctx))
 	}()
 
-	currentSlug, err := txDB.LockManagedTeam(ctx, project.ID)
-
+	if project.ClusterID != nil {
+		if err := clusterassign.Lock(ctx, tx, *project.ClusterID); err != nil {
+			return Project{}, false, err
+		}
+	}
+	current, err := txDB.LockManagedTeam(ctx, project.ID)
 	switch {
 	case err == nil:
-		stored, err = reconcileProject(ctx, txDB, project, currentSlug)
+		if current.DeletedAt != nil {
+			return Project{}, false, ErrProjectNotFound
+		}
+		if project.ClusterID != nil && (current.ClusterID == nil || *project.ClusterID != *current.ClusterID) {
+			return Project{}, false, ErrProjectClusterFixed
+		}
+		stored, err = reconcileProject(ctx, txDB, project, current.Slug)
 	case dberrors.IsNotFoundError(err):
+		if project.ClusterID != nil {
+			if err := clusterassign.Check(ctx, s.clusters, *project.ClusterID, project.ID); err != nil {
+				return Project{}, false, err
+			}
+		}
 		stored, err = createProject(ctx, txDB, project)
 		created = true
 	default:
@@ -94,7 +105,6 @@ func (s *Service) writeProject(ctx context.Context, project Project) (stored Pro
 	if err != nil {
 		return Project{}, false, err
 	}
-
 	if err := tx.Commit(ctx); err != nil {
 		return Project{}, false, fmt.Errorf("commit project upsert: %w", err)
 	}
@@ -127,11 +137,10 @@ func createProject(ctx context.Context, txDB *authqueries.Queries, project Proje
 
 func reconcileProject(ctx context.Context, txDB *authqueries.Queries, project Project, currentSlug string) (Project, error) {
 	updated, err := txDB.UpdateManagedTeam(ctx, authqueries.UpdateManagedTeamParams{
-		ClusterID: project.ClusterID,
-		ID:        project.ID,
-		Name:      project.Name,
-		Slug:      project.Slug,
-		Email:     project.Email,
+		ID:    project.ID,
+		Name:  project.Name,
+		Slug:  project.Slug,
+		Email: project.Email,
 	})
 
 	switch {

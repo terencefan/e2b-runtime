@@ -70,6 +70,22 @@ func TestParse(t *testing.T) {
 		assert.Empty(t, result.SecretsStoreBackendGrpcAddress)
 	})
 
+	t.Run("scheduling api address is optional and has no default", func(t *testing.T) { //nolint:paralleltest // cannot call t.Setenv and t.Parallel
+		removeEnv(t, "SCHEDULING_API_GRPC_ADDRESS")
+
+		result, err := Parse()
+		require.NoError(t, err)
+		assert.Empty(t, result.SchedulingAPIGrpcAddress)
+	})
+
+	t.Run("scheduling api address is read when set", func(t *testing.T) {
+		t.Setenv("SCHEDULING_API_GRPC_ADDRESS", "dns:///scheduling-api:5000")
+
+		result, err := Parse()
+		require.NoError(t, err)
+		assert.Equal(t, "dns:///scheduling-api:5000", result.SchedulingAPIGrpcAddress)
+	})
+
 	t.Run("secrets store backend address is read when set", func(t *testing.T) {
 		t.Setenv("SECRETS_STORE_BACKEND_GRPC_ADDRESS", "secrets-backend:5000")
 
@@ -158,9 +174,7 @@ func removeEnv(t *testing.T, key string) {
 
 	prevValue, ok := os.LookupEnv(key)
 
-	if err := os.Unsetenv(key); err != nil {
-		t.Fatalf("cannot unset environment variable: %v", err)
-	}
+	require.NoError(t, os.Unsetenv(key))
 
 	if ok {
 		t.Cleanup(func() {
